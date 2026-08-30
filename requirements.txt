@@ -1,0 +1,4 @@
+alpaca-py==0.44.0
+python-dotenv==1.0.1
+scikit-learn==1.9.0
+joblib==1.5.3

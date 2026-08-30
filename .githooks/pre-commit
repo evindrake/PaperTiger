@@ -1,0 +1,47 @@
+#!/bin/sh
+# Local secret-scanning safety net, run before every commit. This is a
+# second line of defense behind .gitignore, not a replacement for it --
+# .gitignore stops these files from being staged in the first place; this
+# hook catches the case where someone force-adds one anyway (`git add -f`)
+# or pastes a live-looking credential into a file that isn't ignored.
+#
+# One-time setup (per clone): git config core.hooksPath .githooks
+
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$staged" ] && exit 0
+
+blocked=0
+
+for f in $staged; do
+    case "$f" in
+        *.env.example) continue ;;
+        .env|*.env)
+            echo "pre-commit: refusing to commit '$f' -- looks like a real .env file, not the template" >&2
+            blocked=1
+            continue
+            ;;
+    esac
+
+    [ -f "$f" ] || continue
+
+    # Skip files git considers binary (numstat prints "-" for additions).
+    if git diff --cached --numstat -- "$f" | grep -q '^-	'; then
+        continue
+    fi
+
+    hit=$(grep -InE \
+        '(-----BEGIN (RSA|EC|OPENSSH|DSA|PGP) PRIVATE KEY-----)|((API|SECRET)_?(KEY)?[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9/+_-]{16,})|(\bPK[A-Z0-9]{16,}\b)' \
+        "$f")
+    if [ -n "$hit" ]; then
+        echo "pre-commit: possible secret in '$f':" >&2
+        echo "$hit" | sed 's/^/  /' >&2
+        blocked=1
+    fi
+done
+
+if [ "$blocked" -ne 0 ]; then
+    echo "pre-commit: commit blocked. If this is a false positive, use 'git commit --no-verify' deliberately." >&2
+    exit 1
+fi
+
+exit 0

@@ -1,0 +1,39 @@
+# --- Secrets / personal config -----------------------------------------
+# Any .env variant is ignored EXCEPT the committed template.
+.env
+.env.*
+!.env.example
+
+# --- Python environment / cache -----------------------------------------
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# --- Runtime state, results, and generated artifacts (all personal/
+#     account-specific or regenerable -- none of this belongs in git) ----
+runtime_state.json
+runtime_state.json.tmp
+backtest_results.json
+walkforward_results.json
+core_holdings.json
+ml_model.joblib
+selftest_results.json
+notifications.json
+notifications.json.tmp
+trade_history.jsonl
+equity_history.jsonl
+equity_history.jsonl.tmp
+HALT
+logs/
+
+# --- OS / editor cruft ----------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.idea/
+.vscode/

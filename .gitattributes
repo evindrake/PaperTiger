@@ -1,0 +1,11 @@
+# Force LF endings for scripts with shebangs, regardless of the committer's
+# platform/autocrlf setting -- CRLF here breaks `./script.sh` on Linux/macOS
+# with a cryptic "bad interpreter" error.
+*.sh text eol=lf
+
+# Keep Windows-native scripts CRLF -- PowerShell tolerates either, but this
+# keeps diffs clean for anyone editing them on Windows.
+*.ps1 text eol=crlf
+
+# Everything else: normalize text files to LF, let git decide on the rest.
+* text=auto eol=lf
