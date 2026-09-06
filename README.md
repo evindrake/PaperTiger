@@ -199,7 +199,7 @@ stale.
 | `backtest.py` | Offline simulator. Same caps as live, fills at next bar's open, buy-and-hold benchmark, core-satellite support. |
 | `walkforward.py` | Train/test parameter sweep + out-of-sample verdict, signal-agnostic (grid picked from `SIGNAL_KIND`). |
 | `sweep_signal_params.py` | Quick single-pass comparison across many parameter combos -- exploration only, NOT a substitute for walk-forward. |
-| `dashboard.py` | Stdlib HTTP status page, tabbed (Live/Kill Switch/Events/Backtest/Walk-Forward/Status/Config/About), with beginner-friendly explanations and a kill-switch control (HALT/FLATTEN also send a notification and kick off a background self-test). The Config tab additionally lets you pick a risk profile and set manual per-field overrides (see `safety.RiskProfileStore`) -- still cannot place a trade or touch the symbol whitelist. |
+| `dashboard.py` | Stdlib HTTP status page, tabbed (Live/Kill Switch/Events/Backtest/Walk-Forward/Status/Config/About), with beginner-friendly explanations and a kill-switch control (HALT/FLATTEN also send a notification and kick off a background self-test). The Config tab additionally lets you pick a risk profile and set manual per-field overrides (see `safety.RiskProfileStore`) -- still cannot place a trade or touch the symbol whitelist. Optionally reachable from your phone over Tailscale (`--tailscale`, off by default) -- see "Remote access from your phone" below. |
 | `preflight.py` | Pre-run checks. Never places an order. |
 | `run.py` | Entrypoint: wires config -> broker -> strategy -> engine. |
 | `scripts/refresh_tactical_universe.py` | Weekly job: ranks `candidate_universe.json` by liquidity and writes the top symbols to `tactical_universe.json` -- the dynamic satellite pool the engine trades in addition to the static core `SYMBOLS`. |
@@ -322,40 +322,70 @@ submits, tactical or core-satellite bootstrap -- unlike the dashboard's
 rolling 200-entry event log, this file is never trimmed or reset on
 restart.
 
-## Future: remote access from your phone (not yet implemented)
+## Remote access from your phone (Tailscale)
 
-If you later want to check the dashboard from your phone over cellular
-data, here's the tradeoff space, cheapest and simplest first. None of this
-is implemented -- it's here so the decision is easy to revisit.
+**Implemented, opt-in, off by default.** `dashboard.py --tailscale` (or the
+`ENABLE_TAILSCALE`-equivalent -- see `run()`'s `--tailscale` flag) binds a
+*second* listener on this machine's current Tailscale IPv4 address,
+auto-detected fresh at every startup via `tailscale ip -4` (so it survives
+Tailscale ever reassigning the address). The primary `127.0.0.1` listener
+is unaffected -- this is additive, not a replacement.
 
-1. **Tailscale (recommended).** A free personal-use WireGuard-based mesh
-   VPN. Install it on the PC and on your phone (both free apps), sign in
-   with the same account on each, and the dashboard becomes reachable at a
-   private Tailscale address/hostname (MagicDNS) -- no port forwarding, no
-   public exposure at all, no certificate to buy (Tailscale encrypts
-   everything itself). This is purpose-built for exactly this "reach my
-   home machine from my phone, just me" use case, and is the option to
-   default to unless you specifically want a plain public URL.
-2. **Cloudflare Tunnel + Cloudflare Access.** Free tier, no port forwarding
-   either (an outbound-only `cloudflared` daemon on the PC creates the
-   tunnel), and Cloudflare issues/manages the HTTPS certificate for you
-   automatically -- no DigiCert purchase needed. Cloudflare Access sits in
-   front and requires a login (e.g. via a one-time email code) before
-   anyone reaches the dashboard. Needs a domain name you control pointed at
-   Cloudflare (~$10-15/year) but gives you a normal browser URL with no VPN
-   client required on the phone. A reasonable alternative to Tailscale if
-   you want that.
-3. **Traditional port-forward + certificate (not recommended).** Buying a
-   cert from DigiCert is unnecessary even here -- Let's Encrypt issues
-   free, trusted certs -- but this whole approach means opening a port on
-   your home router directly to the internet behind a reverse proxy
-   (nginx/Caddy), which is both the most setup work and the most exposed
-   attack surface of the three. Only worth it if you specifically need
-   something neither of the above provides.
+Setup (once):
+1. Install Tailscale on the PC (`winget install Tailscale.Tailscale`) and
+   sign in (`tailscale up` prints a login URL). Install the Tailscale app
+   on your phone and sign in with the same account.
+2. Pass `--tailscale` when starting `dashboard.py` (already wired into
+   `scripts/install_services.ps1`'s `PaperTiger-Dashboard` registration via
+   `Install-PtService`'s `-ExtraArgs`).
+3. From your phone (on the tailnet, cellular data is fine -- no VPN client
+   config needed beyond the Tailscale app itself), browse to
+   `http://<this-PC's-tailscale-IP>:8787` (find it with `tailscale ip -4`
+   on the PC, or `tailscale status`).
 
-Either of the first two keeps the dashboard exactly as it is today (bound
-to `127.0.0.1`, cannot place a trade) -- remote access would layer on top,
-not change what the dashboard itself can do.
+This is deliberately NOT a bind to `0.0.0.0`: the socket only ever listens
+on `127.0.0.1` and this machine's specific Tailscale IP, so it's reachable
+from other devices on your own tailnet and nowhere else -- not the rest of
+your home LAN, not the public internet. If Tailscale isn't installed or
+isn't logged in, `--tailscale` silently degrades to local-only rather than
+failing to start (see `dashboard._detect_tailscale_ip()`).
+
+**MagicDNS (recommended, free, on by default for most tailnets):** gives
+each device a stable hostname (`<device-name>.<tailnet-id>.ts.net`) instead
+of a bare IP, so bookmark that instead of the numeric address -- it
+survives Tailscale ever reassigning the IP, with zero code changes here.
+Check `tailscale status` / the admin console if you're not sure it's on.
+
+**HTTPS: deliberately not enabled, and not recommended for this setup.**
+Tailscale can issue a real Let's Encrypt cert for a device's `.ts.net`
+name (`tailscale cert`, or `tailscale serve` to front the existing
+plain-HTTP listener with zero code changes here) -- but enabling
+certificate issuance for a tailnet publishes that device name in
+Certificate Transparency logs: a public, append-only ledger that cannot be
+edited or removed once an entry lands, by design, across every CT log
+operator. That permanently, publicly links your tailnet's ID to whatever
+device name you issue a cert for. The security upside is marginal here --
+Tailscale's WireGuard transport already encrypts everything end-to-end
+between your devices, so plain HTTP over the tailnet isn't the same
+exposure as plain HTTP over the open internet; HTTPS on top would mainly
+buy a browser padlock and defense against something else on the same PC
+sniffing loopback traffic before it hits the tunnel. A permanent public
+ledger entry isn't a good trade for that, so this project leaves HTTPS off.
+
+Two alternatives, if you'd rather not use Tailscale (not implemented here,
+listed for reference):
+
+- **Cloudflare Tunnel + Cloudflare Access.** Free tier, no port forwarding
+  (an outbound-only `cloudflared` daemon creates the tunnel), Cloudflare
+  issues/manages the HTTPS certificate automatically. Needs a domain name
+  you control pointed at Cloudflare (~$10-15/year), but gives a normal
+  browser URL with no VPN client required on the phone.
+- **Traditional port-forward + certificate (not recommended).** Let's
+  Encrypt issues free certs, but this means opening a port on your home
+  router directly to the internet behind a reverse proxy (nginx/Caddy) --
+  both the most setup work and the most exposed attack surface of the
+  three. Only worth it if you specifically need something neither of the
+  above provides.
 
 ## Running the tests
 

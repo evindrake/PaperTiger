@@ -1,5 +1,6 @@
 """Unit tests for dashboard.py's pure rendering helpers -- no server needed."""
 
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import dashboard
 from dashboard import (
+    _detect_tailscale_ip,
     _env,
     _escape,
     _handle_kill_action,
@@ -33,6 +35,34 @@ from dashboard import (
     _svg_equity_curve,
 )
 from safety import KillMode, KillSwitch, RiskProfileStore
+
+
+class TestDetectTailscaleIp(unittest.TestCase):
+    @patch("dashboard.subprocess.run")
+    def test_returns_ip_on_success(self, mock_run):
+        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="100.64.1.2\n", stderr="")
+        self.assertEqual(_detect_tailscale_ip(), "100.64.1.2")
+
+    @patch("dashboard.subprocess.run")
+    def test_returns_none_when_binary_not_found(self, mock_run):
+        mock_run.side_effect = FileNotFoundError()
+        self.assertIsNone(_detect_tailscale_ip())
+
+    @patch("dashboard.subprocess.run")
+    def test_returns_none_on_nonzero_exit(self, mock_run):
+        # e.g. installed but not logged in -- `tailscale ip` exits non-zero
+        mock_run.side_effect = subprocess.CalledProcessError(returncode=1, cmd=["tailscale", "ip", "-4"])
+        self.assertIsNone(_detect_tailscale_ip())
+
+    @patch("dashboard.subprocess.run")
+    def test_returns_none_on_timeout(self, mock_run):
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd=["tailscale", "ip", "-4"], timeout=3.0)
+        self.assertIsNone(_detect_tailscale_ip())
+
+    @patch("dashboard.subprocess.run")
+    def test_returns_none_on_empty_output(self, mock_run):
+        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        self.assertIsNone(_detect_tailscale_ip())
 
 
 class TestEscape(unittest.TestCase):

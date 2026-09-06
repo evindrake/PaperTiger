@@ -12,7 +12,10 @@ easy to find in services.msc / Task Manager / Get-Service:
   - PaperTiger-Dashboard  (dashboard.py) -- status page at
     http://127.0.0.1:8787 with a kill-switch control and a Config tab for
     live risk-profile/sizing overrides. Cannot place a trade, and cannot
-    touch the symbol whitelist, account type, or round-trip check.
+    touch the symbol whitelist, account type, or round-trip check. Also
+    started with --tailscale here, so it's additionally reachable at this
+    machine's Tailscale IP (see `tailscale ip -4`) from other devices on
+    your own tailnet -- never from the wider LAN or the public internet.
   - PaperTiger-Engine     (run.py)       -- the live (paper by default)
     trading loop.
 
@@ -69,7 +72,8 @@ function Install-PtService {
         [string]$Name,
         [string]$ScriptFile,
         [string]$DisplayName,
-        [string]$Description
+        [string]$Description,
+        [string]$ExtraArgs = ""
     )
 
     if (Get-Service -Name $Name -ErrorAction SilentlyContinue) {
@@ -79,6 +83,13 @@ function Install-PtService {
     }
 
     & $NssmExe install $Name $VenvPython $ScriptFile
+    if ($ExtraArgs) {
+        # Set the full parameter line explicitly via AppParameters rather
+        # than relying on how `nssm install`'s own trailing positional args
+        # get joined -- this is nssm's documented way to set a multi-token
+        # argument string, so it's unambiguous.
+        & $NssmExe set $Name AppParameters "$ScriptFile $ExtraArgs"
+    }
     & $NssmExe set $Name AppDirectory $ProjectDir
     & $NssmExe set $Name DisplayName $DisplayName
     & $NssmExe set $Name Description $Description
@@ -96,9 +107,9 @@ Install-PtService -Name "PaperTiger-Watchdog" -ScriptFile "watchdog.py" `
     -DisplayName "PaperTiger Watchdog" `
     -Description "PaperTiger: watches runtime_state.json's heartbeat; its ONLY power is creating the HALT kill file if the engine hangs. Never trades."
 
-Install-PtService -Name "PaperTiger-Dashboard" -ScriptFile "dashboard.py" `
+Install-PtService -Name "PaperTiger-Dashboard" -ScriptFile "dashboard.py" -ExtraArgs "--tailscale" `
     -DisplayName "PaperTiger Dashboard" `
-    -Description "PaperTiger: status page at http://127.0.0.1:8787 with a kill-switch control and a Config tab for live risk-profile overrides. Cannot place a trade or touch the symbol whitelist."
+    -Description "PaperTiger: status page at http://127.0.0.1:8787 with a kill-switch control and a Config tab for live risk-profile overrides. Cannot place a trade or touch the symbol whitelist. Also reachable over your tailnet -- see dashboard.py's module docstring."
 
 Install-PtService -Name "PaperTiger-Engine" -ScriptFile "run.py" `
     -DisplayName "PaperTiger Engine" `

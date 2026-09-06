@@ -4,11 +4,23 @@ walk-forward results, plus a kill-switch control.
 
 Uses ONLY the Python standard library (http.server) so it can run
 air-gapped: no pip install, no external CDN for CSS/JS/charts (the equity
-curve is hand-drawn inline SVG). Binds to 127.0.0.1 only -- this is a local
-convenience view, not something meant to be exposed on a network. Note that
-`safety.py` (and the strategy.py/signals.py it imports) is pure stdlib too --
-importing safety.KillSwitch here doesn't pull in alpaca-py or python-dotenv,
-so the "no pip install needed" property still holds.
+curve is hand-drawn inline SVG). Binds to 127.0.0.1 only BY DEFAULT -- this
+is a local convenience view, not something meant to be exposed on a
+network. Note that `safety.py` (and the strategy.py/signals.py it imports)
+is pure stdlib too -- importing safety.KillSwitch here doesn't pull in
+alpaca-py or python-dotenv, so the "no pip install needed" property still
+holds.
+
+Optional exception, off by default (--tailscale / ENABLE_TAILSCALE, see
+run()): also bind a second listener on this machine's current Tailscale
+IPv4 address, auto-detected fresh at every startup via `tailscale ip -4`
+(self-healing if Tailscale ever reassigns it). This is deliberately NOT a
+bind to 0.0.0.0 -- the socket itself never listens on any address a
+non-tailnet device (or the public internet) could reach, so this is not
+"a firewall protects it," it's "the listening address itself is scoped."
+If enabled but Tailscale isn't installed/logged in, this silently
+degrades to local-only rather than failing to start -- see
+_detect_tailscale_ip().
 
 CRITICAL PROPERTY: this module cannot place an order, cannot start or
 resume trading on its own, and cannot influence WHAT the engine trades
@@ -62,10 +74,12 @@ import os
 import socketserver
 import subprocess
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from types import SimpleNamespace
+from typing import List, Optional, Tuple
 
 import equity_history
 import notify
@@ -1408,13 +1422,66 @@ class _Handler(BaseHTTPRequestHandler):
     # account type, or the round-trip check. Nothing here can place an order.
 
 
-def run(host: str = "127.0.0.1", port: int = 8787) -> None:
-    with socketserver.TCPServer((host, port), _Handler) as httpd:
-        print(f"[dashboard] serving on http://{host}:{port} (cannot place orders -- kill switch + risk-profile writes only)")
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            print("\n[dashboard] stopped")
+def _detect_tailscale_ip(timeout_sec: float = 3.0) -> Optional[str]:
+    """Best-effort discovery of this machine's current Tailscale IPv4
+    address, by shelling out to the `tailscale` CLI the user already
+    installed to set up their tailnet -- never raises. Returns None on any
+    failure (not installed, not on PATH, not logged in, timeout,
+    unexpected output), so a broken or absent Tailscale install can never
+    prevent the dashboard from starting; it just means the optional
+    second listener in run() gets silently skipped."""
+    try:
+        result = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            capture_output=True, text=True, timeout=timeout_sec, check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    first_line = result.stdout.strip().splitlines()[0].strip() if result.stdout.strip() else ""
+    return first_line or None
+
+
+def run(host: str = "127.0.0.1", port: int = 8787, enable_tailscale: bool = False) -> None:
+    """Starts the primary listener on `host` (127.0.0.1 by default). If
+    enable_tailscale is set, ALSO starts a second listener bound
+    specifically to this machine's current Tailscale IPv4 address (never
+    0.0.0.0) -- see _detect_tailscale_ip() and the module docstring for why
+    that's a materially different, tighter thing than "just open it up."
+    Off by default; a failed/missing Tailscale detection degrades to
+    local-only rather than refusing to start."""
+    servers: List[Tuple[str, socketserver.TCPServer]] = [(host, socketserver.TCPServer((host, port), _Handler))]
+
+    if enable_tailscale:
+        ts_ip = _detect_tailscale_ip()
+        if ts_ip and ts_ip != host:
+            try:
+                servers.append((ts_ip, socketserver.TCPServer((ts_ip, port), _Handler)))
+            except OSError as e:
+                print(f"[dashboard] could not bind Tailscale listener on {ts_ip}:{port}: {e}", file=sys.stderr)
+        elif not ts_ip:
+            print(
+                "[dashboard] --tailscale was set but no Tailscale IPv4 address could be detected -- "
+                "is `tailscale` installed and logged in? Continuing on the local listener only.",
+                file=sys.stderr,
+            )
+
+    threads = []
+    for bind_host, server in servers[1:]:
+        print(f"[dashboard] serving on http://{bind_host}:{port} (cannot place orders -- kill switch + risk-profile writes only)")
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        threads.append(t)
+
+    primary_host, primary_server = servers[0]
+    print(f"[dashboard] serving on http://{primary_host}:{port} (cannot place orders -- kill switch + risk-profile writes only)")
+    try:
+        primary_server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[dashboard] stopped")
+    finally:
+        for _, server in servers:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":
@@ -1423,5 +1490,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PaperTiger dashboard.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8787)
+    parser.add_argument(
+        "--tailscale", action="store_true",
+        help="Also bind a second listener on this machine's current Tailscale IPv4 address "
+             "(auto-detected via `tailscale ip -4`), reachable from other devices on your own "
+             "tailnet -- e.g. your phone. Off by default. Never binds to 0.0.0.0 or the wider LAN.",
+    )
     args = parser.parse_args()
-    run(args.host, args.port)
+    run(args.host, args.port, enable_tailscale=args.tailscale)
