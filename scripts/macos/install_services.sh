@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # install_services.sh -- registers PaperTiger's background processes as
 # launchd LaunchAgents, plus scheduled agents for the daily research
-# retrain and periodic self-test. macOS only.
+# retrain, weekly tactical universe refresh, and periodic self-test.
+# macOS only.
 #
 # No sudo needed -- everything here is installed as a per-user LaunchAgent
 # under ~/Library/LaunchAgents, so it has no more privilege than you do and
@@ -90,6 +91,37 @@ cat > "$AGENT_DIR/com.papertiger.dailyretrain.plist" <<EOF
 EOF
 load_agent "com.papertiger.dailyretrain"
 echo "Installed com.papertiger.dailyretrain (daily at 6:00 AM)."
+
+# -- Weekly tactical universe refresh: re-ranks the dynamic satellite pool
+#    by liquidity (see scripts/refresh_tactical_universe.py) -- purely
+#    additive on top of the static core SYMBOLS whitelist, never touches
+#    core.py's bootstrap sizing (mirrors install_services.ps1's
+#    PaperTiger-TacticalUniverseRefresh). --
+cat > "$AGENT_DIR/com.papertiger.universerefresh.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.papertiger.universerefresh</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$VENV_PYTHON</string>
+        <string>$PROJECT_DIR/scripts/refresh_tactical_universe.py</string>
+    </array>
+    <key>WorkingDirectory</key><string>$PROJECT_DIR</string>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key><integer>0</integer>
+        <key>Hour</key><integer>5</integer>
+        <key>Minute</key><integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key><string>$LOG_DIR/com.papertiger.universerefresh.out.log</string>
+    <key>StandardErrorPath</key><string>$LOG_DIR/com.papertiger.universerefresh.err.log</string>
+</dict>
+</plist>
+EOF
+load_agent "com.papertiger.universerefresh"
+echo "Installed com.papertiger.universerefresh (weekly, Sunday at 5:00 AM)."
 
 # -- Self-test: runs at login and every 4 hours thereafter --
 cat > "$AGENT_DIR/com.papertiger.selftest.plist" <<EOF

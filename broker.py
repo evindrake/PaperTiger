@@ -38,8 +38,8 @@ from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, OrderStatus, QueryOrderStatus, TimeInForce
-from alpaca.trading.requests import ClosePositionRequest, GetOrdersRequest, LimitOrderRequest
+from alpaca.trading.enums import AssetClass, AssetStatus, OrderSide, OrderStatus, QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import ClosePositionRequest, GetAssetsRequest, GetOrdersRequest, LimitOrderRequest
 
 
 class BrokerError(Exception):
@@ -116,6 +116,20 @@ class AssetView:
     fractionable: bool
     shortable: bool
     active: bool
+
+
+@dataclass(frozen=True)
+class TradableAsset:
+    """One entry from a bulk asset listing -- see list_tradable_us_equities().
+    Deliberately richer than AssetView (adds exchange), since the tactical
+    universe refresh needs it to sanity-check candidates before ranking
+    them by liquidity."""
+
+    symbol: str
+    exchange: str
+    tradable: bool
+    fractionable: bool
+    shortable: bool
 
 
 @dataclass(frozen=True)
@@ -412,6 +426,31 @@ class Broker:
             shortable=bool(a.shortable),
             active=(status.upper() == "ACTIVE"),
         )
+
+    def list_tradable_us_equities(self) -> List[TradableAsset]:
+        """One bulk call for every active, tradable US equity Alpaca lists --
+        used by scripts/refresh_tactical_universe.py to confirm which
+        candidates from the static candidate_universe.json are currently
+        tradable before ranking them by liquidity. Deliberately a single
+        request (not one per candidate): this can return several thousand
+        rows, so callers should intersect with their own small candidate
+        list rather than iterating this directly."""
+        try:
+            assets = self._trading.get_all_assets(
+                GetAssetsRequest(status=AssetStatus.ACTIVE, asset_class=AssetClass.US_EQUITY)
+            )
+        except APIError as e:
+            raise BrokerError(f"get_all_assets failed: {e}") from e
+        return [
+            TradableAsset(
+                symbol=a.symbol,
+                exchange=a.exchange.value if hasattr(a.exchange, "value") else str(a.exchange),
+                tradable=bool(a.tradable),
+                fractionable=bool(a.fractionable),
+                shortable=bool(a.shortable),
+            )
+            for a in assets
+        ]
 
 
 def _days(n: int):

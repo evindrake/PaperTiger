@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install_services.sh -- registers PaperTiger's background processes as
-# systemd --user services, plus timers for the daily research retrain and
-# periodic self-test. Linux only.
+# systemd --user services, plus timers for the daily research retrain,
+# weekly tactical universe refresh, and periodic self-test. Linux only.
 #
 # No sudo/root needed -- everything here is installed under YOUR OWN user
 # account via `systemctl --user`, so it has no more privilege than you do
@@ -96,6 +96,37 @@ EOF
 systemctl --user daemon-reload
 systemctl --user enable --now papertiger-dailyretrain.timer
 echo "Installed papertiger-dailyretrain.timer (daily at 6:00 AM)."
+
+# -- Weekly tactical universe refresh: re-ranks the dynamic satellite pool
+#    by liquidity (see scripts/refresh_tactical_universe.py) -- purely
+#    additive on top of the static core SYMBOLS whitelist, never touches
+#    core.py's bootstrap sizing (mirrors install_services.ps1's
+#    PaperTiger-TacticalUniverseRefresh). --
+cat > "$UNIT_DIR/papertiger-universerefresh.service" <<EOF
+[Unit]
+Description=PaperTiger: weekly re-ranking of the dynamic tactical/satellite symbol pool by liquidity.
+
+[Service]
+Type=oneshot
+WorkingDirectory=$PROJECT_DIR
+ExecStart=$VENV_PYTHON $PROJECT_DIR/scripts/refresh_tactical_universe.py
+EOF
+
+cat > "$UNIT_DIR/papertiger-universerefresh.timer" <<EOF
+[Unit]
+Description=Run papertiger-universerefresh.service weekly on Sunday at 5am
+
+[Timer]
+OnCalendar=Sun *-*-* 05:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable --now papertiger-universerefresh.timer
+echo "Installed papertiger-universerefresh.timer (weekly, Sunday at 5:00 AM)."
 
 # -- Self-test: runs the full unit test suite shortly after boot/login and
 #    every 4 hours thereafter, to catch environment drift in an unattended

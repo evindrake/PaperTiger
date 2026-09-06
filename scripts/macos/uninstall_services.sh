@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # uninstall_services.sh -- removes everything install_services.sh set up:
 # the LaunchAgents for PaperTiger's watchdog, dashboard, engine, daily
-# retrain, self-test, and desktop notifier.
+# retrain, weekly tactical universe refresh, self-test, and desktop notifier.
 #
 # This only removes the AGENT REGISTRATIONS -- it does not touch any
 # project files, results, or your .env. Your Alpaca account and any open
@@ -14,7 +14,7 @@ set -uo pipefail
 AGENT_DIR="$HOME/Library/LaunchAgents"
 
 for label in com.papertiger.watchdog com.papertiger.dashboard com.papertiger.engine \
-             com.papertiger.dailyretrain com.papertiger.selftest com.papertiger.notifier; do
+             com.papertiger.dailyretrain com.papertiger.universerefresh com.papertiger.selftest com.papertiger.notifier; do
     plist="$AGENT_DIR/${label}.plist"
     if [ -f "$plist" ]; then
         echo "Stopping and removing $label..."

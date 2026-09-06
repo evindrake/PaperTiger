@@ -13,21 +13,26 @@ from dashboard import (
     _env,
     _escape,
     _handle_kill_action,
+    _handle_risk_override_action,
+    _handle_risk_profile_action,
     _handle_test_notification,
     _load_env_file_values,
     _notify_cfg,
     _render_about_tab,
+    _render_config_tab,
     _render_content,
     _render_events,
     _render_kill_switch,
     _render_killswitch_tab,
     _render_live_performance_chart,
     _render_live_tab,
+    _render_locked_config,
     _render_positions_summary,
+    _render_risk_profile_controls,
     _render_status_tab,
     _svg_equity_curve,
 )
-from safety import KillMode, KillSwitch
+from safety import KillMode, KillSwitch, RiskProfileStore
 
 
 class TestEscape(unittest.TestCase):
@@ -353,9 +358,9 @@ class TestRenderAboutTab(unittest.TestCase):
 
 
 class TestRenderContent(unittest.TestCase):
-    def test_produces_all_seven_tab_panels(self):
+    def test_produces_all_eight_tab_panels(self):
         html = _render_content()
-        for tab in ("live", "killswitch", "events", "backtest", "walkforward", "status", "about"):
+        for tab in ("live", "killswitch", "events", "backtest", "walkforward", "status", "config", "about"):
             self.assertIn(f'data-tab="{tab}"', html)
 
     def test_only_live_tab_active_by_default(self):
@@ -457,6 +462,115 @@ class TestHandleKillAction(unittest.TestCase):
         import json as _json
         data = _json.loads(notif_path.read_text(encoding="utf-8"))
         self.assertEqual(len(data), 2)
+
+
+class TestHandleRiskProfileAction(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.risk_path = str(Path(self.tmpdir) / "risk_profile.json")
+        self._orig = dashboard.RISK_PROFILE_FILE_PATH
+        dashboard.RISK_PROFILE_FILE_PATH = self.risk_path
+
+    def tearDown(self):
+        dashboard.RISK_PROFILE_FILE_PATH = self._orig
+
+    def test_valid_profile_writes_file_with_no_overrides(self):
+        result = _handle_risk_profile_action("aggressive")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["profile"], "aggressive")
+        state = RiskProfileStore(self.risk_path).load()
+        self.assertEqual(state.profile, "aggressive")
+        self.assertEqual(state.overrides, {})
+
+    def test_switching_profile_clears_prior_overrides(self):
+        RiskProfileStore(self.risk_path).write("conservative", {"target_trade_usd": 5.0})
+        _handle_risk_profile_action("aggressive")
+        state = RiskProfileStore(self.risk_path).load()
+        self.assertEqual(state.profile, "aggressive")
+        self.assertEqual(state.overrides, {})
+
+    def test_unknown_profile_returns_error_and_does_not_write(self):
+        result = _handle_risk_profile_action("yolo")
+        self.assertFalse(result["ok"])
+        self.assertFalse(Path(self.risk_path).exists())
+
+
+class TestHandleRiskOverrideAction(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.risk_path = str(Path(self.tmpdir) / "risk_profile.json")
+        self._orig = dashboard.RISK_PROFILE_FILE_PATH
+        dashboard.RISK_PROFILE_FILE_PATH = self.risk_path
+
+    def tearDown(self):
+        dashboard.RISK_PROFILE_FILE_PATH = self._orig
+
+    def test_first_override_defaults_the_base_profile_to_normal(self):
+        result = _handle_risk_override_action("target_trade_usd", 33.0)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["profile"], "normal")
+        state = RiskProfileStore(self.risk_path).load()
+        self.assertEqual(state.profile, "normal")
+        self.assertEqual(state.overrides, {"target_trade_usd": 33.0})
+
+    def test_override_on_top_of_an_existing_profile_preserves_it(self):
+        RiskProfileStore(self.risk_path).write("aggressive", {})
+        _handle_risk_override_action("max_open_positions", 4)
+        state = RiskProfileStore(self.risk_path).load()
+        self.assertEqual(state.profile, "aggressive")
+        self.assertEqual(state.overrides, {"max_open_positions": 4.0})
+
+    def test_none_value_clears_the_override(self):
+        RiskProfileStore(self.risk_path).write("normal", {"target_trade_usd": 33.0})
+        result = _handle_risk_override_action("target_trade_usd", None)
+        self.assertTrue(result["ok"])
+        state = RiskProfileStore(self.risk_path).load()
+        self.assertEqual(state.overrides, {})
+
+    def test_field_outside_allow_list_rejected(self):
+        result = _handle_risk_override_action("symbols", ["TSLA"])
+        self.assertFalse(result["ok"])
+        self.assertFalse(Path(self.risk_path).exists())
+
+    def test_non_numeric_value_rejected(self):
+        result = _handle_risk_override_action("target_trade_usd", "a lot")
+        self.assertFalse(result["ok"])
+
+
+class TestRenderConfigTab(unittest.TestCase):
+    def test_renders_profile_buttons_and_tunable_rows(self):
+        html = _render_config_tab(None)
+        self.assertIn("ptSetProfile('conservative')", html)
+        self.assertIn("ptSetProfile('normal')", html)
+        self.assertIn("ptSetProfile('aggressive')", html)
+        self.assertIn("Max open tactical positions", html)
+        self.assertIn("Tactical trade size", html)
+
+    def test_shows_effective_values_from_config_snapshot(self):
+        state = {
+            "config_snapshot": {
+                "symbols": ["SPY", "QQQ"],
+                "tactical_universe": ["AAPL"],
+                "signal_kind": "sma_crossover",
+                "risk_profile": {
+                    "name": "aggressive",
+                    "effective": {"target_trade_usd": 40.0, "max_open_positions": 10},
+                },
+            }
+        }
+        html = _render_risk_profile_controls(state)
+        self.assertIn("Aggressive", html)
+        self.assertIn("$40.00", html)
+
+    def test_locked_section_shows_core_and_tactical_symbols_separately(self):
+        state = {"config_snapshot": {"symbols": ["SPY", "QQQ"], "tactical_universe": ["AAPL"]}}
+        html = _render_locked_config(state)
+        self.assertIn("SPY, QQQ", html)
+        self.assertIn("AAPL", html)
+
+    def test_locked_section_handles_no_tactical_universe_yet(self):
+        html = _render_locked_config({"config_snapshot": {"symbols": ["SPY"], "tactical_universe": []}})
+        self.assertIn("none yet", html)
 
 
 class TestHandleTestNotification(unittest.TestCase):

@@ -1,0 +1,13 @@
+{
+  "_comment": "Static, user-editable pool of liquid US stocks eligible for the tactical/satellite sleeve -- NOT the live trading list. scripts/refresh_tactical_universe.py intersects this with what Alpaca currently reports as active+tradable US equities, ranks the survivors by recent average dollar volume, and writes the top TACTICAL_UNIVERSE_SIZE of them to tactical_universe.json (which the engine actually reads). Edit this list freely -- add/remove tickers you want considered; nothing here is ever traded directly.",
+  "symbols": [
+    "AAPL", "MSFT", "AMZN", "GOOGL", "META", "NVDA", "TSLA", "AVGO", "ORCL", "CRM",
+    "ADBE", "CSCO", "AMD", "INTC", "QCOM", "TXN", "IBM", "NOW", "INTU", "AMAT",
+    "JPM", "BAC", "WFC", "GS", "MS", "V", "MA", "AXP", "BLK", "SCHW",
+    "UNH", "JNJ", "LLY", "ABBV", "MRK", "PFE", "TMO", "ABT", "DHR", "BMY",
+    "HD", "LOW", "MCD", "NKE", "SBUX", "TGT", "COST", "WMT", "PG", "KO",
+    "PEP", "PM", "MO", "CL", "KMB", "GIS", "XOM", "CVX", "COP", "SLB",
+    "UNP", "UPS", "HON", "CAT", "DE", "BA", "GE", "LMT", "RTX", "MMM",
+    "DIS", "CMCSA", "NFLX", "T", "VZ", "TMUS", "LIN", "APD", "NEE", "DUK"
+  ]
+}

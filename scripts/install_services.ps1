@@ -29,6 +29,11 @@ data every day (see daily_retrain.ps1) -- this is the part that actually
 keeps "searching" for a better configuration; run.py itself just executes
 whatever signal is currently configured.
 
+Also registers a weekly Scheduled Task, PaperTiger-TacticalUniverseRefresh,
+that re-ranks the dynamic satellite/tactical symbol pool by liquidity (see
+scripts/refresh_tactical_universe.py) -- purely additive on top of the
+static core SYMBOLS whitelist, never touches core.py's bootstrap sizing.
+
 Logs for each service go to logs\<ServiceName>.out.log / .err.log in the
 project directory, rotated at 5MB.
 #>
@@ -116,6 +121,28 @@ Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Se
 Write-Host ""
 Write-Host "Registered scheduled task $TaskName (daily at 6:00 AM)."
 
+# -- Weekly tactical universe refresh task -- re-ranks the dynamic
+#    satellite pool (see scripts/refresh_tactical_universe.py) from
+#    candidate_universe.json against current liquidity. Runs the Python
+#    script directly (no .ps1 wrapper needed), same pattern as the
+#    self-test task below. Weekly, not daily: this is a slow-moving
+#    liquidity ranking, not something that benefits from being refreshed
+#    more often, and it keeps Alpaca API usage light. --
+$UniverseTaskName = "PaperTiger-TacticalUniverseRefresh"
+Unregister-ScheduledTask -TaskName $UniverseTaskName -Confirm:$false -ErrorAction SilentlyContinue
+
+$UniverseScript = Join-Path $ProjectDir "scripts\refresh_tactical_universe.py"
+$UniverseAction = New-ScheduledTaskAction -Execute $VenvPython -Argument "`"$UniverseScript`"" -WorkingDirectory $ProjectDir
+$UniverseTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At 5:00AM
+$UniverseSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 5)
+$UniversePrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Limited
+
+Register-ScheduledTask -TaskName $UniverseTaskName -Action $UniverseAction -Trigger $UniverseTrigger `
+    -Settings $UniverseSettings -Principal $UniversePrincipal `
+    -Description "PaperTiger: weekly re-ranking of the dynamic tactical/satellite symbol pool (candidate_universe.json -> tactical_universe.json) by liquidity. Purely additive on top of the static core SYMBOLS -- never touches core.py or the round-trip check." | Out-Null
+
+Write-Host "Registered scheduled task $UniverseTaskName (weekly, Sunday 5:00 AM)."
+
 # -- Self-test task: runs the full unit test suite at system startup AND
 #    on a recurring schedule, to catch environment drift in an unattended
 #    deployment (see selftest.py's module docstring). Two triggers on one
@@ -167,7 +194,7 @@ Start-ScheduledTask -TaskName $TrayTaskName
 Write-Host ""
 Write-Host "All done. Check status with:"
 Write-Host "  Get-Service PaperTiger-*"
-Write-Host "  Get-ScheduledTask -TaskName PaperTiger-DailyResearch, PaperTiger-SelfTest, PaperTiger-TrayNotifier"
+Write-Host "  Get-ScheduledTask -TaskName PaperTiger-DailyResearch, PaperTiger-TacticalUniverseRefresh, PaperTiger-SelfTest, PaperTiger-TrayNotifier"
 Write-Host ""
 Write-Host "Stop everything at any time with the dashboard's kill switch, or"
 Write-Host "'nssm stop PaperTiger-Engine'. To fully remove, run uninstall_services.ps1."

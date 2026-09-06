@@ -53,7 +53,14 @@ from types import SimpleNamespace
 
 import equity_history
 import notify
-from safety import KillMode, KillSwitch
+from safety import (
+    DEFAULT_RISK_PROFILE,
+    RISK_PROFILE_PRESETS,
+    RISK_PROFILE_TUNABLE_FIELDS,
+    KillMode,
+    KillSwitch,
+    RiskProfileStore,
+)
 
 STATE_FILE = "runtime_state.json"
 BACKTEST_FILE = "backtest_results.json"
@@ -76,6 +83,10 @@ EVENTS_TAB_EVENT_COUNT = 100
 # you've customized KILL_FILE_PATH in .env, either export the same value in
 # the shell that launches dashboard.py, or edit the default below to match.
 KILL_FILE_PATH = os.environ.get("KILL_FILE_PATH", "HALT")
+
+# Same reasoning as KILL_FILE_PATH above -- if you've customized
+# RISK_PROFILE_FILE_PATH in .env, export the same value here too.
+RISK_PROFILE_FILE_PATH = os.environ.get("RISK_PROFILE_FILE_PATH", "risk_profile.json")
 
 
 def _load_env_file_values(path: str = ".env") -> dict:
@@ -667,6 +678,170 @@ def _render_status_tab(state, selftest) -> str:
     '''
 
 
+def _render_risk_profile_controls(state) -> str:
+    """The dashboard's one OTHER write path besides the kill switch (see
+    module docstring) -- but narrowly scoped the same way: this can only
+    ever adjust the 7 fields in safety.RISK_PROFILE_TUNABLE_FIELDS (position
+    sizing / caps / how many tactical positions can be open at once). It
+    cannot touch the symbol whitelist, the account type, or the same-day
+    round-trip check -- that check has no Config field behind it at all,
+    so there is no lever here that could ever reach it, even in principle.
+    """
+    cfg_snap = (state or {}).get("config_snapshot") or {}
+    risk = cfg_snap.get("risk_profile") or {}
+    current_profile = risk.get("name") or DEFAULT_RISK_PROFILE
+    eff = risk.get("effective") or {}
+
+    def profile_button(name: str) -> str:
+        cls = "btn-profile-active" if name == current_profile else "btn-profile"
+        return f'<button class="btn {cls}" onclick="ptSetProfile(\'{name}\')">{name.capitalize()}</button>'
+
+    profile_buttons = "".join(profile_button(n) for n in RISK_PROFILE_PRESETS)
+
+    def field_row(field: str, label: str, value_html: str, placeholder: str, explanation: str) -> str:
+        return f'''
+          <tr>
+            <td>{label}</td>
+            <td>{value_html}</td>
+            <td>
+              <input type="number" step="any" id="pt-risk-{field}" placeholder="{placeholder}">
+              <button class="btn btn-clear" onclick="ptSetOverride('{field}')">Apply</button>
+              <button class="btn btn-clear" onclick="ptResetOverride('{field}')">Reset</button>
+            </td>
+            <td class="explain">{explanation}</td>
+          </tr>
+        '''
+
+    rows = (
+        field_row(
+            "target_trade_usd", "Tactical trade size", f'${eff.get("target_trade_usd", 0):.2f}', "e.g. 25",
+            "Dollar size of each NEW tactical buy the signal opens (sized into fractional shares). "
+            "Bigger = fewer, larger bets; smaller = more, smaller bets from the same capital.",
+        )
+        + field_row(
+            "max_position_usd", "Per-position cap", f'${eff.get("max_position_usd", 0):.2f}', "e.g. 60",
+            "Hard dollar ceiling on any ONE tactical position. A buy that would push a position "
+            "past this is rejected outright, regardless of what the signal wants.",
+        )
+        + field_row(
+            "max_concentration_pct", "Concentration cap", f'{eff.get("max_concentration_pct", 0)*100:.0f}%', "e.g. 0.35 = 35%",
+            "Cap on any one position as a share of TOTAL account equity -- guards against one symbol "
+            "dominating the account even if max_position_usd alone would still allow it.",
+        )
+        + field_row(
+            "cash_buffer_usd", "Cash buffer", f'${eff.get("cash_buffer_usd", 0):.2f}', "e.g. 10",
+            "Minimum cash the engine always leaves untouched -- a buy that would dip buying power "
+            "below this amount is refused.",
+        )
+        + field_row(
+            "daily_loss_limit_pct", "Daily loss limit", f'{eff.get("daily_loss_limit_pct", 0)*100:.0f}%', "e.g. 0.03 = 3%",
+            "Circuit breaker: if equity falls this much below where it started TODAY, the engine "
+            "automatically FLATTENs (cancels open orders, sells everything to cash).",
+        )
+        + field_row(
+            "max_drawdown_pct", "Max drawdown limit", f'{eff.get("max_drawdown_pct", 0)*100:.0f}%', "e.g. 0.15 = 15%",
+            "Circuit breaker: if equity falls this much below its ALL-TIME peak, the engine "
+            "automatically FLATTENs -- the longer-horizon sibling of the daily loss limit above.",
+        )
+        + field_row(
+            "max_open_positions", "Max open tactical positions", f'{eff.get("max_open_positions", 0):g}', "e.g. 6",
+            "Cap on how many DIFFERENT tactical (non-core) symbols can be held open at once. Adding "
+            "to a symbol already open doesn't count against this -- it only blocks opening a NEW one "
+            "once the cap is hit, which is what keeps a wide symbol universe from becoming a pile of "
+            "tiny buys.",
+        )
+    )
+
+    return f'''
+      <div class="killswitch">
+        <div class="killswitch-status">Current profile: <strong>{_escape(current_profile.capitalize())}</strong></div>
+        <div class="killswitch-buttons">{profile_buttons}</div>
+        <div id="pt-profile-msg" class="killswitch-msg"></div>
+      </div>
+      <table>
+        <thead><tr><th>Field</th><th>Effective value</th><th>Manual override</th><th>What it does</th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table>
+      <div id="pt-override-msg" class="killswitch-msg"></div>
+    '''
+
+
+def _render_locked_config(state) -> str:
+    cfg_snap = (state or {}).get("config_snapshot") or {}
+    paper = _env("ALPACA_PAPER", "true").strip().lower() in ("1", "true", "yes", "on")
+    core_alloc_raw = _env("CORE_ALLOCATION_PCT", "0.5")
+    try:
+        core_alloc_pct = float(core_alloc_raw) * 100
+    except ValueError:
+        core_alloc_pct = 0.0
+    symbols = ", ".join(cfg_snap.get("symbols", [])) or _escape(_env("SYMBOLS", "-"))
+    tactical_universe = cfg_snap.get("tactical_universe") or []
+    tactical_html = (
+        _escape(", ".join(tactical_universe)) if tactical_universe
+        else "none yet -- run scripts/refresh_tactical_universe.py"
+    )
+    return f'''
+      <table>
+        <thead><tr><th>Field</th><th>Value</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Account type</td><td>{"PAPER" if paper else "LIVE (real money)"}</td>
+            <td class="explain">Whether this engine trades Alpaca's paper (fake money) or live endpoint. Switching to
+            live requires BOTH ALPACA_PAPER=false AND an explicit real-money acknowledgment flag in .env --
+            guard_live() refuses to start otherwise.</td>
+          </tr>
+          <tr>
+            <td>Core symbols (static, buy-and-hold)</td><td>{symbols}</td>
+            <td class="explain">The permanent whitelist -- bought ONCE and never sold by this bot, regardless of what
+            the tactical signal says. Captures the market's long-run drift no matter how the signal performs.</td>
+          </tr>
+          <tr>
+            <td>Tactical universe (dynamic, weekly refresh)</td><td>{tactical_html}</td>
+            <td class="explain">Extra symbols the tactical signal is ALSO currently allowed to trade, on top of the
+            core list above -- selected weekly by ranking a candidate pool by liquidity (see
+            scripts/refresh_tactical_universe.py). Purely additive: core symbols keep trading normally even if this
+            is empty.</td>
+          </tr>
+          <tr>
+            <td>Core allocation</td><td>{core_alloc_pct:.0f}%</td>
+            <td class="explain">The fraction of seed capital permanently set aside into the core buy-and-hold sleeve
+            above, split equal-weight across the core symbols. The rest ("satellite") is what the tactical signal
+            actively trades.</td>
+          </tr>
+          <tr>
+            <td>Signal</td><td>{_escape(cfg_snap.get("signal_kind") or _env("SIGNAL_KIND", "-"))}</td>
+            <td class="explain">Which strategy is generating the tactical buy/sell decisions -- SMA crossover
+            (trend-following), RSI reversion (mean-reversion), or an experimental ML classifier. None of these have
+            been shown to beat plain buy-and-hold (see the About tab).</td>
+          </tr>
+        </tbody>
+      </table>
+    '''
+
+
+def _render_config_tab(state) -> str:
+    return f'''
+      <h2>Risk Profile</h2>
+      <div class="hint">
+        Conservative / Normal / Aggressive only ever adjust position sizing, caps, and how many distinct
+        tactical positions can be open at once. Picking a profile can NEVER touch the symbol whitelist,
+        the account type, or the same-day round-trip check -- that check has no configurable backing at
+        all, so nothing on this page has a lever that could reach it. Selecting a profile resets any
+        manual overrides below to that profile's defaults; a manual override on top of a profile persists
+        across restarts until you reset it. Percent fields take a plain fraction, same as .env.example
+        (0.03 means 3%).
+      </div>
+      {_render_risk_profile_controls(state)}
+
+      <h2>Locked Configuration</h2>
+      <div class="hint">
+        These can only be changed by editing .env and restarting the engine -- nothing on this page can
+        touch them, by design.
+      </div>
+      {_render_locked_config(state)}
+    '''
+
+
 def _render_about_tab() -> str:
     return '''
       <h2>About PaperTiger</h2>
@@ -721,6 +896,7 @@ def _render_content() -> str:
       <div class="tab-panel" data-tab="backtest">{_render_backtest_tab(backtest)}</div>
       <div class="tab-panel" data-tab="walkforward">{_render_walkforward_tab(walkforward)}</div>
       <div class="tab-panel" data-tab="status">{_render_status_tab(state, selftest)}</div>
+      <div class="tab-panel" data-tab="config">{_render_config_tab(state)}</div>
       <div class="tab-panel" data-tab="about">{_render_about_tab()}</div>
     '''
 
@@ -753,6 +929,7 @@ def _render_page() -> str:
   table {{ border-collapse: collapse; margin-top: 12px; width: 100%; }}
   th, td {{ text-align: left; padding: 6px 10px; border-bottom: 1px solid #2a2e37; font-size: 13px; }}
   th {{ color: #9ca3af; font-weight: 500; }}
+  td.explain {{ color: #8b93a1; font-size: 12px; line-height: 1.5; max-width: 420px; }}
   .totals-row td {{ border-top: 2px solid #3f4451; border-bottom: none; }}
   .empty {{ color: #6b7280; font-size: 13px; margin-top: 8px; }}
   .hint {{ color: #8b93a1; font-size: 12.5px; line-height: 1.5; margin-top: 6px; max-width: 720px; }}
@@ -771,7 +948,11 @@ def _render_page() -> str:
   .btn-halt {{ background: #fbbf24; }}
   .btn-flatten {{ background: #f87171; }}
   .btn-clear {{ background: #4b5563; color: #e5e7eb; }}
+  .btn-profile {{ background: #374151; color: #e5e7eb; }}
+  .btn-profile-active {{ background: #3b82f6; color: #0f1115; }}
   .btn:hover {{ filter: brightness(1.1); }}
+  input[type=number] {{ width: 90px; background: #0f1115; border: 1px solid #2a2e37; color: #e5e7eb;
+                        border-radius: 4px; padding: 4px 6px; font-size: 12px; margin-right: 6px; }}
   .killswitch-msg {{ margin-top: 8px; font-size: 12px; color: #93c5fd; min-height: 1em; }}
   .tabs {{ display: flex; gap: 4px; border-bottom: 1px solid #2a2e37; margin-top: 12px; flex-wrap: wrap; }}
   .tab-btn {{ background: none; border: none; color: #9ca3af; padding: 8px 14px; font-size: 13px; font-weight: 600;
@@ -801,6 +982,7 @@ def _render_page() -> str:
     <button class="tab-btn" data-tab="backtest" onclick="showTab('backtest')">Backtest</button>
     <button class="tab-btn" data-tab="walkforward" onclick="showTab('walkforward')">Walk-Forward</button>
     <button class="tab-btn" data-tab="status" onclick="showTab('status')">Status</button>
+    <button class="tab-btn" data-tab="config" onclick="showTab('config')">Config</button>
     <button class="tab-btn" data-tab="about" onclick="showTab('about')">About</button>
   </nav>
 
@@ -908,6 +1090,61 @@ def _render_page() -> str:
       }}
     }}
 
+    async function ptSetProfile(name) {{
+      const msg = document.getElementById('pt-profile-msg');
+      if (msg) msg.textContent = 'Switching to ' + name + '...';
+      try {{
+        const res = await fetch('/api/risk-profile', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{profile: name}})
+        }});
+        const data = await res.json();
+        if (data.ok) {{
+          if (msg) msg.textContent = 'Switched to ' + name + '. Manual overrides were reset.';
+          refreshContent();
+        }} else {{
+          if (msg) msg.textContent = 'Error: ' + (data.error || 'unknown');
+        }}
+      }} catch (e) {{
+        if (msg) msg.textContent = 'Request failed: ' + e;
+      }}
+    }}
+
+    async function ptSendOverride(field, value) {{
+      const msg = document.getElementById('pt-override-msg');
+      if (msg) msg.textContent = 'Saving...';
+      try {{
+        const res = await fetch('/api/risk-override', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{field: field, value: value}})
+        }});
+        const data = await res.json();
+        if (data.ok) {{
+          if (msg) msg.textContent = 'Saved.';
+          refreshContent();
+        }} else {{
+          if (msg) msg.textContent = 'Error: ' + (data.error || 'unknown');
+        }}
+      }} catch (e) {{
+        if (msg) msg.textContent = 'Request failed: ' + e;
+      }}
+    }}
+
+    function ptSetOverride(field) {{
+      const input = document.getElementById('pt-risk-' + field);
+      const msg = document.getElementById('pt-override-msg');
+      if (!input || input.value === '') {{ if (msg) msg.textContent = 'Enter a value first.'; return; }}
+      const value = parseFloat(input.value);
+      if (Number.isNaN(value)) {{ if (msg) msg.textContent = 'Not a number.'; return; }}
+      ptSendOverride(field, value);
+    }}
+
+    function ptResetOverride(field) {{
+      ptSendOverride(field, null);
+    }}
+
     async function ptTestNotification() {{
       const msg = document.getElementById('pt-notify-test-msg');
       if (msg) msg.textContent = 'Sending...';
@@ -991,6 +1228,42 @@ def _handle_kill_action(action: str) -> dict:
     return {"ok": False, "error": f"unknown action {action!r}"}
 
 
+def _handle_risk_profile_action(profile: str) -> dict:
+    """POST /api/risk-profile -- switches the live risk profile, resetting
+    any manual overrides to the new profile's defaults. See the module
+    docstring and _render_risk_profile_controls() for why this write path
+    is scoped the way it is (only the 7 fields in
+    safety.RISK_PROFILE_TUNABLE_FIELDS, never symbols/account-type/the
+    round-trip check)."""
+    if profile not in RISK_PROFILE_PRESETS:
+        return {"ok": False, "error": f"unknown profile {profile!r}"}
+    RiskProfileStore(RISK_PROFILE_FILE_PATH).write(profile, {})
+    return {"ok": True, "profile": profile}
+
+
+def _handle_risk_override_action(field: str, value) -> dict:
+    """POST /api/risk-override -- sets (or, if value is None, clears) one
+    manual override on top of the currently-selected profile. `field` is
+    checked against the same allow-list RiskProfileStore.load() itself
+    enforces on read, so this is defense in depth, not the only gate."""
+    if field not in RISK_PROFILE_TUNABLE_FIELDS:
+        return {"ok": False, "error": f"{field!r} is not an adjustable field"}
+    store = RiskProfileStore(RISK_PROFILE_FILE_PATH)
+    state = store.load()
+    profile = state.profile or DEFAULT_RISK_PROFILE
+    overrides = dict(state.overrides)
+    if value is None:
+        overrides.pop(field, None)
+    else:
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": f"{value!r} is not numeric"}
+        overrides[field] = value
+    store.write(profile, overrides)
+    return {"ok": True, "profile": profile, "overrides": overrides}
+
+
 def _handle_test_notification() -> dict:
     """POST /api/test-notification -- sends a notification with no kill-
     switch side effect at all, so notification setup can be verified
@@ -1042,27 +1315,41 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def _read_json_body(self) -> dict:
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            return json.loads(raw or b"{}")
+        except json.JSONDecodeError:
+            return {}
+
     def do_POST(self) -> None:  # noqa: N802 (http.server's required method name)
         if self.path == "/api/kill":
-            length = int(self.headers.get("Content-Length", 0) or 0)
-            raw = self.rfile.read(length) if length else b"{}"
-            try:
-                payload = json.loads(raw or b"{}")
-            except json.JSONDecodeError:
-                payload = {}
+            payload = self._read_json_body()
             action = str(payload.get("action", "")).strip().lower()
             self._send_json(_handle_kill_action(action))
         elif self.path == "/api/test-notification":
             self._send_json(_handle_test_notification())
+        elif self.path == "/api/risk-profile":
+            payload = self._read_json_body()
+            profile = str(payload.get("profile", "")).strip().lower()
+            self._send_json(_handle_risk_profile_action(profile))
+        elif self.path == "/api/risk-override":
+            payload = self._read_json_body()
+            field = str(payload.get("field", "")).strip()
+            value = payload.get("value", None)
+            self._send_json(_handle_risk_override_action(field, value))
         else:
             self.send_response(404)
             self.end_headers()
 
     # No PUT/DELETE/etc. handler exists at all -- any other write attempt
     # gets a plain 501 from the base class. do_POST above is the ONLY write
-    # path, and both its routes are narrowly scoped (see module docstring):
-    # the kill switch can only stop or resume trading, and the test
-    # notification only sends a notification -- neither can place an order.
+    # path, and every route on it is narrowly scoped (see module docstring):
+    # the kill switch can only stop or resume trading, the test notification
+    # only sends a notification, and the risk-profile/override routes can
+    # only adjust safety.RISK_PROFILE_TUNABLE_FIELDS -- never symbols,
+    # account type, or the round-trip check. Nothing here can place an order.
 
 
 def run(host: str = "127.0.0.1", port: int = 8787) -> None:

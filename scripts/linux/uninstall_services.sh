@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # uninstall_services.sh -- removes everything install_services.sh set up:
 # the systemd --user services/timers for PaperTiger's watchdog, dashboard,
-# engine, daily retrain, self-test, and desktop notifier.
+# engine, daily retrain, weekly tactical universe refresh, self-test, and
+# desktop notifier.
 #
 # This only removes the SERVICE REGISTRATIONS -- it does not touch any
 # project files, results, or your .env. Your Alpaca account and any open
@@ -19,7 +20,7 @@ for name in papertiger-watchdog papertiger-dashboard papertiger-engine papertige
     rm -f "$UNIT_DIR/${name}.service"
 done
 
-for name in papertiger-dailyretrain papertiger-selftest; do
+for name in papertiger-dailyretrain papertiger-universerefresh papertiger-selftest; do
     echo "Removing ${name}.timer / ${name}.service..."
     systemctl --user disable --now "${name}.timer" >/dev/null 2>&1 || true
     rm -f "$UNIT_DIR/${name}.timer" "$UNIT_DIR/${name}.service"

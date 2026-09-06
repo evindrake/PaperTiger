@@ -6,6 +6,7 @@ selling more than held, stale quote, limit far from mid, duplicate open
 order, sub-min-notional, and a valid small fractional buy that should pass.
 """
 
+import json
 import sys
 import unittest
 from datetime import date, datetime, timedelta, timezone
@@ -15,7 +16,16 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from broker import OrderView, Position, Quote
-from safety import BreakerAction, CircuitBreakers, KillMode, KillSwitch, PreTradeCheck
+from safety import (
+    DEFAULT_RISK_PROFILE,
+    RISK_PROFILE_PRESETS,
+    BreakerAction,
+    CircuitBreakers,
+    KillMode,
+    KillSwitch,
+    PreTradeCheck,
+    RiskProfileStore,
+)
 from strategy import OrderIntent
 
 
@@ -201,6 +211,72 @@ class TestKillSwitch(unittest.TestCase):
         ks.trigger(KillMode.HALT, "test")
         ks.clear()
         self.assertFalse(ks.is_triggered())
+
+
+class TestRiskProfileStore(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.mkdtemp()
+        self.path = str(Path(self.tmpdir) / "risk_profile.json")
+
+    def test_missing_file_fails_closed_to_no_profile_and_empty_resolve(self):
+        # Critical: a missing file must resolve() to {} (apply nothing), NOT
+        # to the "normal" preset's hardcoded numbers -- otherwise a fresh
+        # install with no risk_profile.json would silently clobber whatever
+        # the operator actually configured in .env with these defaults.
+        store = RiskProfileStore(self.path)
+        state = store.load()
+        self.assertIsNone(state.profile)
+        self.assertEqual(state.overrides, {})
+        self.assertEqual(state.resolve(), {})
+
+    def test_malformed_json_fails_closed(self):
+        Path(self.path).write_text("{not valid json", encoding="utf-8")
+        state = RiskProfileStore(self.path).load()
+        self.assertIsNone(state.profile)
+        self.assertEqual(state.overrides, {})
+        self.assertEqual(state.resolve(), {})
+
+    def test_unknown_profile_name_falls_back_to_no_profile(self):
+        Path(self.path).write_text(json.dumps({"profile": "yolo"}), encoding="utf-8")
+        state = RiskProfileStore(self.path).load()
+        self.assertIsNone(state.profile)
+        self.assertEqual(state.resolve(), {})
+
+    def test_write_then_load_round_trips_profile_and_overrides(self):
+        store = RiskProfileStore(self.path)
+        store.write("aggressive", {"target_trade_usd": 33.0})
+        state = store.load()
+        self.assertEqual(state.profile, "aggressive")
+        self.assertEqual(state.overrides, {"target_trade_usd": 33.0})
+        resolved = state.resolve()
+        self.assertEqual(resolved["target_trade_usd"], 33.0)  # override wins
+        self.assertEqual(resolved["max_open_positions"], RISK_PROFILE_PRESETS["aggressive"]["max_open_positions"])
+
+    def test_write_rejects_unknown_profile(self):
+        store = RiskProfileStore(self.path)
+        with self.assertRaises(ValueError):
+            store.write("yolo", {})
+
+    def test_load_drops_override_keys_outside_the_allow_list(self):
+        # Simulates a hand-edited or malformed file trying to touch a
+        # locked field -- this must never be allowed to reach Config.
+        payload = {"profile": "normal", "overrides": {"symbols": ["TSLA"], "alpaca_paper": False, "target_trade_usd": 12.0}}
+        Path(self.path).write_text(json.dumps(payload), encoding="utf-8")
+        state = RiskProfileStore(self.path).load()
+        self.assertEqual(state.overrides, {"target_trade_usd": 12.0})
+
+    def test_load_drops_non_numeric_and_boolean_override_values(self):
+        payload = {"profile": "normal", "overrides": {"target_trade_usd": "a lot", "max_open_positions": True}}
+        Path(self.path).write_text(json.dumps(payload), encoding="utf-8")
+        state = RiskProfileStore(self.path).load()
+        self.assertEqual(state.overrides, {})
+
+    def test_write_is_atomic_no_tmp_file_left_behind(self):
+        store = RiskProfileStore(self.path)
+        store.write("conservative")
+        self.assertFalse(Path(self.path + ".tmp").exists())
+        self.assertTrue(Path(self.path).exists())
 
 
 class TestCircuitBreakers(unittest.TestCase):

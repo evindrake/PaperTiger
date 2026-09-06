@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from broker import Broker, _round_to_tick
+from broker import Broker, TradableAsset, _round_to_tick
 
 
 class TestRoundToTick(unittest.TestCase):
@@ -46,13 +46,28 @@ class _FakeOrder:
         self.submitted_at = datetime.now(timezone.utc)
 
 
+class _FakeAsset:
+    def __init__(self, symbol, exchange="NASDAQ", tradable=True, fractionable=True, shortable=False):
+        self.symbol = symbol
+        self.exchange = exchange
+        self.tradable = tradable
+        self.fractionable = fractionable
+        self.shortable = shortable
+
+
 class _FakeTradingClient:
     def __init__(self):
         self.last_request = None
+        self.last_assets_filter = None
+        self.assets_to_return = []
 
     def submit_order(self, order_data):
         self.last_request = order_data
         return _FakeOrder(order_data.limit_price)
+
+    def get_all_assets(self, filter=None):
+        self.last_assets_filter = filter
+        return list(self.assets_to_return)
 
 
 def make_broker():
@@ -87,6 +102,31 @@ class TestSubmitLimitSellRoundsPrice(unittest.TestCase):
         broker = make_broker()
         broker.submit_limit_sell("SPY", 1.0, 764.60384, "cid-3")
         self.assertEqual(broker._trading.last_request.limit_price, 764.6)
+
+
+class TestListTradableUsEquities(unittest.TestCase):
+    def test_normalizes_sdk_assets_into_tradable_asset_dataclasses(self):
+        broker = make_broker()
+        broker._trading.assets_to_return = [
+            _FakeAsset("AAPL", exchange="NASDAQ", tradable=True, fractionable=True, shortable=True),
+            _FakeAsset("XYZ", exchange="OTC", tradable=False, fractionable=False, shortable=False),
+        ]
+        result = broker.list_tradable_us_equities()
+        self.assertEqual(
+            result,
+            [
+                TradableAsset(symbol="AAPL", exchange="NASDAQ", tradable=True, fractionable=True, shortable=True),
+                TradableAsset(symbol="XYZ", exchange="OTC", tradable=False, fractionable=False, shortable=False),
+            ],
+        )
+
+    def test_is_a_single_bulk_call_not_one_per_candidate(self):
+        broker = make_broker()
+        broker._trading.assets_to_return = [_FakeAsset("AAPL")]
+        broker.list_tradable_us_equities()
+        # get_all_assets was called with a filter object, once -- confirms
+        # this doesn't loop per-symbol under the hood.
+        self.assertIsNotNone(broker._trading.last_assets_filter)
 
 
 if __name__ == "__main__":

@@ -88,6 +88,7 @@ class Config:
     daily_loss_limit_pct: float     # e.g. 0.03 = flatten if down 3% on the day
     max_drawdown_pct: float         # e.g. 0.15 = flatten if 15% below equity peak
     max_consecutive_errors: int     # halt after this many consecutive loop errors
+    max_open_positions: int         # cap on distinct symbols with tactical (non-core) qty open at once
 
     # --- Market data / execution sanity ---
     quote_max_age_sec: float    # reject a quote older than this many seconds
@@ -95,10 +96,15 @@ class Config:
 
     # --- Loop / operational ---
     loop_interval_sec: float
-    symbols: Tuple[str, ...]    # whitelist -- the ONLY symbols we will ever trade
+    symbols: Tuple[str, ...]    # core whitelist -- static, drives core.py bootstrap sizing
     kill_file_path: str
     state_file_path: str
     history_lookback_days: int  # how many daily bars to keep cached per symbol
+    risk_profile_file_path: str      # live-reloadable conservative/normal/aggressive profile + overrides
+    candidate_universe_file_path: str  # static, user-editable pool of symbols eligible for the tactical universe
+    tactical_universe_file_path: str   # weekly-refreshed subset of the candidate pool actually traded
+    tactical_universe_size: int        # how many top-liquidity candidates to select each refresh
+    tactical_universe_lookback_days: int  # bars window used to rank candidates by dollar volume
 
     # --- Signal parameters (fed into signals.Signal) ---
     signal_fast: int
@@ -180,6 +186,7 @@ def load_config(env_path: str | None = None) -> Config:
         daily_loss_limit_pct=_get_float("DAILY_LOSS_LIMIT_PCT", 0.03),
         max_drawdown_pct=_get_float("MAX_DRAWDOWN_PCT", 0.15),
         max_consecutive_errors=_get_int("MAX_CONSECUTIVE_ERRORS", 3),
+        max_open_positions=_get_int("MAX_OPEN_POSITIONS", 6),
         quote_max_age_sec=_get_float("QUOTE_MAX_AGE_SEC", 60.0),
         limit_offset_pct=_get_float("LIMIT_OFFSET_PCT", 0.05),
         loop_interval_sec=_get_float("LOOP_INTERVAL_SEC", 300.0),
@@ -187,6 +194,11 @@ def load_config(env_path: str | None = None) -> Config:
         kill_file_path=_get_str("KILL_FILE_PATH", "HALT"),
         state_file_path=_get_str("STATE_FILE_PATH", "runtime_state.json"),
         history_lookback_days=_get_int("HISTORY_LOOKBACK_DAYS", 60),
+        risk_profile_file_path=_get_str("RISK_PROFILE_FILE_PATH", "risk_profile.json"),
+        candidate_universe_file_path=_get_str("CANDIDATE_UNIVERSE_FILE_PATH", "candidate_universe.json"),
+        tactical_universe_file_path=_get_str("TACTICAL_UNIVERSE_FILE_PATH", "tactical_universe.json"),
+        tactical_universe_size=_get_int("TACTICAL_UNIVERSE_SIZE", 25),
+        tactical_universe_lookback_days=_get_int("TACTICAL_UNIVERSE_LOOKBACK_DAYS", 20),
         signal_fast=_get_int("SIGNAL_FAST", 10),
         signal_slow=_get_int("SIGNAL_SLOW", 30),
         signal_kind=_get_str("SIGNAL_KIND", "sma_crossover"),

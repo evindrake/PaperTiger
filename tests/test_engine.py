@@ -15,6 +15,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from broker import AccountSnapshot, OrderView, Position, Quote
+from config import Config
 from engine import Engine
 from safety import KillMode, KillSwitch
 
@@ -85,7 +86,14 @@ class FakeBroker:
 
 
 def make_cfg(tmpdir, symbols=("SPY",), **overrides):
+    """Builds a real config.Config (not a SimpleNamespace) -- engine.py's
+    live risk-profile/tactical-universe merge uses dataclasses.replace(),
+    which requires an actual dataclass instance."""
     base = dict(
+        alpaca_api_key="",
+        alpaca_secret_key="",
+        alpaca_paper=True,
+        seed_usd=200.0,
         symbols=symbols,
         signal_fast=3,
         signal_slow=10,
@@ -93,6 +101,9 @@ def make_cfg(tmpdir, symbols=("SPY",), **overrides):
         signal_period=14,
         signal_oversold=30.0,
         signal_overbought=70.0,
+        signal_model_path=str(Path(tmpdir) / "ml_model.joblib"),
+        signal_ml_buy_threshold=0.55,
+        signal_ml_sell_threshold=0.45,
         loop_interval_sec=300.0,
         target_trade_usd=25.0,
         min_notional_usd=5.0,
@@ -104,17 +115,29 @@ def make_cfg(tmpdir, symbols=("SPY",), **overrides):
         daily_loss_limit_pct=0.03,
         max_drawdown_pct=0.15,
         max_consecutive_errors=3,
+        max_open_positions=10,
         history_lookback_days=60,
         kill_file_path=str(Path(tmpdir) / "HALT"),
         state_file_path=str(Path(tmpdir) / "runtime_state.json"),
+        risk_profile_file_path=str(Path(tmpdir) / "risk_profile.json"),
+        candidate_universe_file_path=str(Path(tmpdir) / "candidate_universe.json"),
+        tactical_universe_file_path=str(Path(tmpdir) / "tactical_universe.json"),
+        tactical_universe_size=25,
+        tactical_universe_lookback_days=20,
         core_allocation_pct=0.0,
         core_holdings_file_path=str(Path(tmpdir) / "core_holdings.json"),
+        notify_smtp_host="",
+        notify_smtp_port=587,
+        notify_smtp_username="",
+        notify_smtp_password="",
+        notify_from_email="",
+        notify_to=(),
         notify_local_file_path=str(Path(tmpdir) / "notifications.json"),
         trade_log_file_path=str(Path(tmpdir) / "trade_history.jsonl"),
         equity_history_file_path=str(Path(tmpdir) / "equity_history.jsonl"),
     )
     base.update(overrides)
-    return SimpleNamespace(**base)
+    return Config(**base)
 
 
 class TestEngineTick(unittest.TestCase):
@@ -243,6 +266,66 @@ class TestEngineTick(unittest.TestCase):
             qty=0.25, notional=None, filled_qty=0.25, filled_avg_price=100.0,
             limit_price=100.0, submitted_at=None,
         )
+
+        engine = Engine(cfg, broker=fake)
+        engine.tick()
+
+        self.assertEqual(fake.submitted_sells, [])
+
+    def test_max_open_positions_caps_new_tactical_buys(self):
+        cfg = make_cfg(self.tmpdir, symbols=("AAA", "BBB", "CCC"), max_open_positions=2)
+        fake = FakeBroker()
+        for sym in cfg.symbols:
+            fake._closes[sym] = [float(i) for i in range(1, 21)]  # uptrend on all three
+
+        engine = Engine(cfg, broker=fake)
+        engine.tick()
+
+        bought_symbols = {b[0] for b in fake.submitted_buys}
+        self.assertEqual(len(bought_symbols), 2)
+        # Deterministic which two: propose() iterates cfg.symbols in order,
+        # so the cap should let the first two through and skip the third.
+        self.assertEqual(bought_symbols, {"AAA", "BBB"})
+
+    def test_max_open_positions_does_not_block_sells_of_already_open_symbols(self):
+        # The cap only ever gates opening a NEW distinct tactical symbol --
+        # it must never block a sell signal on a symbol already held.
+        cfg = make_cfg(self.tmpdir, symbols=("AAA", "BBB"), max_open_positions=1)
+        fake = FakeBroker()
+        fake._positions["AAA"] = Position(
+            symbol="AAA", qty=1.0, market_value=10.0, avg_entry_price=10.0,
+            current_price=10.0, side="long",
+        )
+        # Downtrend ending just above FakeBroker.quote()'s fixed mid (99.5)
+        # so the engine's "append the live quote onto cached closes" step
+        # doesn't itself look like a reversal -- see signals.Signal.
+        fake._closes["AAA"] = [float(i) for i in range(120, 100, -1)]  # -> sell
+        fake._closes["BBB"] = [float(i) for i in range(1, 21)]         # uptrend -> would-be buy
+
+        engine = Engine(cfg, broker=fake)
+        engine.tick()
+
+        self.assertEqual(len(fake.submitted_sells), 1)
+        self.assertEqual(fake.submitted_sells[0][0], "AAA")
+        self.assertEqual(fake.submitted_buys, [])  # BBB blocked: AAA already occupies the 1-position cap
+
+    def test_tactical_universe_symbol_trades_in_addition_to_core_symbols(self):
+        # A symbol present ONLY in tactical_universe.json (never in
+        # cfg.symbols) must still get quotes/history/signals and be
+        # tradable -- purely additive on top of the static core whitelist.
+        cfg = make_cfg(self.tmpdir, symbols=("SPY",))
+        Path(cfg.tactical_universe_file_path).write_text(
+            json.dumps({"symbols": ["ZZZ"]}), encoding="utf-8"
+        )
+        fake = FakeBroker()
+        fake._closes["ZZZ"] = [float(i) for i in range(1, 21)]  # uptrend
+
+        engine = Engine(cfg, broker=fake)
+        engine.tick()
+
+        bought_symbols = {b[0] for b in fake.submitted_buys}
+        self.assertIn("ZZZ", bought_symbols)
+        self.assertNotIn("ZZZ", cfg.symbols)  # confirms it came from the universe file, not cfg.symbols
 
         engine = Engine(cfg, broker=fake)
         engine.tick()

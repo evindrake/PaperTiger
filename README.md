@@ -70,6 +70,35 @@ the bot. That guarantees at least part of your capital captures the
 market's long-run drift regardless of whether the tactical signal ever
 finds a real edge. Set `CORE_ALLOCATION_PCT=0` to disable it entirely.
 
+## Risk profiles & the dynamic tactical universe
+
+Two more knobs, both live-adjustable from the dashboard's **Config** tab
+without restarting anything:
+
+- **Risk profile** (Conservative / Normal / Aggressive): a named preset
+  over exactly 7 sizing/circuit-breaker fields (trade size, per-position
+  cap, concentration cap, cash buffer, daily loss limit, max drawdown,
+  and `max_open_positions`), plus optional manual overrides on top. Picked
+  from the dashboard, written to `risk_profile.json`, and re-read fresh by
+  the engine every tick -- see `safety.RiskProfileStore`. This can **never**
+  touch the symbol whitelist, the account type, or the same-day round-trip
+  check: those have no configurable backing at all, so there is no lever
+  on this page that could reach them, even in principle. A missing or
+  corrupted `risk_profile.json` changes nothing -- it fails closed to
+  whatever `.env` already says, never to a preset's hardcoded numbers.
+- **Dynamic tactical/satellite universe**: `SYMBOLS` in `.env` remains the
+  static **core** whitelist (drives `core.py`'s bootstrap sizing and never
+  changes automatically). Separately, `candidate_universe.json` is a small,
+  static, user-editable pool of well-known liquid US stocks; a weekly job
+  (`scripts/refresh_tactical_universe.py`) confirms which candidates are
+  currently tradable, ranks the survivors by recent dollar volume, and
+  writes the top `TACTICAL_UNIVERSE_SIZE` (default 25) to
+  `tactical_universe.json`. The engine reads that file fresh every tick and
+  trades it **in addition to** (never instead of) the core symbols.
+  `MAX_OPEN_POSITIONS` (also profile-tunable) caps how many *distinct*
+  tactical symbols can be open at once, so a wider universe can't turn into
+  a pile of tiny buys.
+
 ## Setup checklist
 
 New to this? "Paper trading" means Alpaca gives you a fake account funded
@@ -105,7 +134,10 @@ mode, and going live is a separate, deliberate, multi-step opt-in (step 4)
    diversification learning (the original four are ~0.85-0.99 correlated
    with each other and didn't diversify anything) -- this list has not been
    deliberated as a live-money allocation and should be re-examined,
-   not just carried over, when that day comes.
+   not just carried over, when that day comes. The same goes for
+   `candidate_universe.json` if you've enabled the dynamic tactical
+   universe (see below) -- it's a hand-picked starter list, not a
+   deliberated live-money allocation either.
 
 ## Typical session runbook
 
@@ -136,7 +168,7 @@ SIGNAL_KIND=ml_classifier python walkforward.py
 #    stable parameters): start the watchdog, the dashboard, and the engine.
 #    Three separate processes/terminals:
 python watchdog.py
-python dashboard.py          # http://127.0.0.1:8787 (Live/Kill Switch/Events/Backtest/Walk-Forward/Status/About tabs)
+python dashboard.py          # http://127.0.0.1:8787 (Live/Kill Switch/Events/Backtest/Walk-Forward/Status/Config/About tabs)
 python run.py                 # the live (paper, by default) trading loop
 ```
 
@@ -167,9 +199,10 @@ stale.
 | `backtest.py` | Offline simulator. Same caps as live, fills at next bar's open, buy-and-hold benchmark, core-satellite support. |
 | `walkforward.py` | Train/test parameter sweep + out-of-sample verdict, signal-agnostic (grid picked from `SIGNAL_KIND`). |
 | `sweep_signal_params.py` | Quick single-pass comparison across many parameter combos -- exploration only, NOT a substitute for walk-forward. |
-| `dashboard.py` | Stdlib HTTP status page, tabbed (Live/Kill Switch/Events/Backtest/Walk-Forward/Status/About), with beginner-friendly explanations and a kill-switch control (HALT/FLATTEN also send a notification and kick off a background self-test). Cannot place a trade. |
+| `dashboard.py` | Stdlib HTTP status page, tabbed (Live/Kill Switch/Events/Backtest/Walk-Forward/Status/Config/About), with beginner-friendly explanations and a kill-switch control (HALT/FLATTEN also send a notification and kick off a background self-test). The Config tab additionally lets you pick a risk profile and set manual per-field overrides (see `safety.RiskProfileStore`) -- still cannot place a trade or touch the symbol whitelist. |
 | `preflight.py` | Pre-run checks. Never places an order. |
 | `run.py` | Entrypoint: wires config -> broker -> strategy -> engine. |
+| `scripts/refresh_tactical_universe.py` | Weekly job: ranks `candidate_universe.json` by liquidity and writes the top symbols to `tactical_universe.json` -- the dynamic satellite pool the engine trades in addition to the static core `SYMBOLS`. |
 | `generate_synthetic_data.py` | Writes fake OHLCV CSVs into `data/` for offline testing. |
 | `selftest.py` | Runs the full unit test suite programmatically, writes `selftest_results.json` for the dashboard's Status tab. A health check for unattended deployments, not a dev-testing replacement. |
 | `notify.py` | Optional, free-by-construction email/SMS notifications (plain SMTP + carrier email-to-SMS gateways) for HALT/FLATTEN/watchdog events. Always writes a local record for the desktop notifier (`scripts/tray_notifier.ps1` on Windows, `scripts/notifier.sh` on Linux/macOS) too. Never raises. |
@@ -183,14 +216,16 @@ All three platforms install the same shape of thing: `watchdog.py`,
 services; a daily task that reruns `backtest.py` + `walkforward.py` +
 `train_ml_signal.py` against fresh data (the part that keeps searching for
 a better configuration -- `run.py` itself only ever executes whatever
-signal is currently set in `.env`); a periodic self-test
-(`selftest.py`, at startup/login and every 4 hours) that catches
-environment drift in the unattended deployment itself, separate from
-`preflight.py` (which checks the account, not the code); and a desktop
-notification popup for HALT/FLATTEN/watchdog events, which -- on every
-platform -- has to run in your interactive login session rather than as a
-background service, since none of them allow a headless service to draw
-desktop UI.
+signal is currently set in `.env`); a **weekly** task that reruns
+`scripts/refresh_tactical_universe.py` to re-rank the dynamic tactical
+universe by liquidity (see "Risk profiles & the dynamic tactical universe"
+above); a periodic self-test (`selftest.py`, at startup/login and every 4
+hours) that catches environment drift in the unattended deployment itself,
+separate from `preflight.py` (which checks the account, not the code); and
+a desktop notification popup for HALT/FLATTEN/watchdog events, which -- on
+every platform -- has to run in your interactive login session rather than
+as a background service, since none of them allow a headless service to
+draw desktop UI.
 
 This is safe to run unattended in paper mode on any platform:
 `config.py`'s `guard_live()` refuses to trade real money unless both
@@ -202,16 +237,17 @@ again the instant they do.
 **Windows** (the most tested path -- this is what the project was
 originally built and run on): `scripts/install_services.ps1` uses NSSM
 (`winget install NSSM.NSSM`) for the three services and Task Scheduler for
-`PaperTiger-DailyResearch` / `PaperTiger-SelfTest` / `PaperTiger-TrayNotifier`
-(the tray-balloon notifier). Run once from an **elevated (Administrator)**
-PowerShell prompt:
+`PaperTiger-DailyResearch` / `PaperTiger-TacticalUniverseRefresh` /
+`PaperTiger-SelfTest` / `PaperTiger-TrayNotifier` (the tray-balloon
+notifier). Run once from an **elevated (Administrator)** PowerShell
+prompt:
 ```
 .\scripts\install_services.ps1
 ```
 Useful commands afterward:
 ```
 Get-Service PaperTiger-*                          # status of all three services
-Get-ScheduledTask -TaskName PaperTiger-DailyResearch, PaperTiger-SelfTest, PaperTiger-TrayNotifier
+Get-ScheduledTask -TaskName PaperTiger-DailyResearch, PaperTiger-TacticalUniverseRefresh, PaperTiger-SelfTest, PaperTiger-TrayNotifier
 nssm stop PaperTiger-Engine                        # stop just the trading loop
 .\scripts\uninstall_services.ps1                   # remove everything (elevated)
 ```
@@ -220,12 +256,14 @@ Logs land in `logs\PaperTiger-<Name>.out.log` / `.err.log` (rotated at
 and the daily research run logs to `logs\daily_retrain.log`.
 
 **Linux** and **macOS**: `scripts/linux/install_services.sh` (systemd
-`--user` services + timers) and `scripts/macos/install_services.sh`
-(launchd LaunchAgents) provide the same setup. Neither needs root/sudo --
-everything installs under your own user account. **These two were written
-carefully but developed/tested on Windows, not verified against a real
-Linux or Mac machine** -- read the script before running it, and please
-open an issue if something doesn't match what's described there.
+`--user` services + timers, including `papertiger-universerefresh.timer`)
+and `scripts/macos/install_services.sh` (launchd LaunchAgents, including
+`com.papertiger.universerefresh`) provide the same setup. Neither needs
+root/sudo -- everything installs under your own user account. **These two
+were written carefully but developed/tested on Windows, not verified
+against a real Linux or Mac machine** -- read the script before running
+it, and please open an issue if something doesn't match what's described
+there.
 ```
 # Linux
 ./scripts/linux/install_services.sh
@@ -339,7 +377,12 @@ git config core.hooksPath .githooks
 - Slippage/commission are flat, configurable assumptions, not a market-impact model.
 - No T+1 settlement modeling in the backtest simulator (unlike the live engine,
   which structurally refuses same-day round trips -- see `Engine._is_same_day_round_trip`).
-- Small, static ETF whitelist -- survivorship bias is real even for "boring" ETFs.
+- The core whitelist is small and static -- survivorship bias is real even for
+  "boring" ETFs. The optional dynamic tactical universe doesn't fully escape
+  this either: it only ever selects from `candidate_universe.json`, a small,
+  hand-picked starter list, not a real index membership feed -- it changes
+  *which* liquid large-caps get considered week to week, not the underlying
+  selection bias of "someone picked this list by hand."
 - A backtest or even a walk-forward pass is evidence, not proof, of a forward edge.
 - All three bundled signals (SMA crossover, RSI reversion, ML classifier) are
   placeholders/experiments. It is not investment advice, and no part of this

@@ -1,8 +1,9 @@
 <#
 uninstall_services.ps1 -- removes everything install_services.ps1 set up:
 the three PaperTiger-* Windows services and the PaperTiger-DailyResearch /
-PaperTiger-SelfTest / PaperTiger-TrayNotifier scheduled tasks. Run from an
-ELEVATED (Administrator) PowerShell prompt.
+PaperTiger-TacticalUniverseRefresh / PaperTiger-SelfTest /
+PaperTiger-TrayNotifier scheduled tasks. Run from an ELEVATED
+(Administrator) PowerShell prompt.
 
 This only stops/removes the SERVICE REGISTRATIONS -- it does not touch any
 project files, results, or your .env. Your Alpaca account and any open
@@ -34,7 +35,7 @@ foreach ($name in @("PaperTiger-Watchdog", "PaperTiger-Dashboard", "PaperTiger-E
     }
 }
 
-foreach ($taskName in @("PaperTiger-DailyResearch", "PaperTiger-SelfTest", "PaperTiger-TrayNotifier")) {
+foreach ($taskName in @("PaperTiger-DailyResearch", "PaperTiger-TacticalUniverseRefresh", "PaperTiger-SelfTest", "PaperTiger-TrayNotifier")) {
     if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
         try { Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } catch {}
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false

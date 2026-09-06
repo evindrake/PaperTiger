@@ -28,17 +28,26 @@ import sys
 import time
 import traceback
 from collections import deque
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Deque, Dict, List, Optional
+from typing import Deque, Dict, List, Optional, Tuple
 
 import equity_history
 import notify
 import trade_log
 from broker import Broker, BrokerError, OrderView
 from core import CoreAllocator, core_client_order_id
-from safety import BreakerAction, CircuitBreakers, KillMode, KillSwitch, PreTradeCheck
+from safety import (
+    DEFAULT_RISK_PROFILE,
+    RISK_PROFILE_TUNABLE_FIELDS,
+    BreakerAction,
+    CircuitBreakers,
+    KillMode,
+    KillSwitch,
+    PreTradeCheck,
+    RiskProfileStore,
+)
 from strategy import OrderIntent, propose
 
 # How many recent events to keep in the runtime-state snapshot. This is a
@@ -55,6 +64,17 @@ class Engine:
         self.circuit_breakers = CircuitBreakers(cfg)
         self.pre_trade = PreTradeCheck(cfg)
         self.core = CoreAllocator(cfg)
+        self.risk_profile_store = RiskProfileStore(cfg.risk_profile_file_path)
+
+        # Recomputed fresh at the top of every _tick_inner() call (see
+        # _build_effective_cfg) by folding the live risk profile + dynamic
+        # tactical universe on top of the static self.cfg. Seeded to self.cfg
+        # here purely so it's never undefined if something reads it before
+        # the first tick completes. self.cfg itself is NEVER touched by
+        # this -- core.py's CoreAllocator stays pinned to it directly, so
+        # core bootstrap sizing can't be affected by profile/universe changes.
+        self.effective_cfg = cfg
+        self._current_risk_profile_name = DEFAULT_RISK_PROFILE
 
         # symbol -> cached completed daily closes (refreshed once per day)
         self._history_cache: Dict[str, List[float]] = {}
@@ -117,19 +137,28 @@ class Engine:
             # the dashboard's Status tab -- no credentials, just what's
             # actually running right now (loop cadence, signal params, caps).
             "config_snapshot": {
-                "symbols": list(self.cfg.symbols),
+                "symbols": list(self.cfg.symbols),  # static core whitelist -- see core.py
+                "tactical_universe": [s for s in self.effective_cfg.symbols if s not in self.cfg.symbols],
                 "signal_kind": self.cfg.signal_kind,
                 "signal_fast": self.cfg.signal_fast,
                 "signal_slow": self.cfg.signal_slow,
                 "signal_period": self.cfg.signal_period,
                 "signal_oversold": self.cfg.signal_oversold,
                 "signal_overbought": self.cfg.signal_overbought,
-                "target_trade_usd": self.cfg.target_trade_usd,
-                "max_position_usd": self.cfg.max_position_usd,
-                "max_concentration_pct": self.cfg.max_concentration_pct,
-                "daily_loss_limit_pct": self.cfg.daily_loss_limit_pct,
-                "max_drawdown_pct": self.cfg.max_drawdown_pct,
+                "target_trade_usd": self.effective_cfg.target_trade_usd,
+                "max_position_usd": self.effective_cfg.max_position_usd,
+                "max_concentration_pct": self.effective_cfg.max_concentration_pct,
+                "daily_loss_limit_pct": self.effective_cfg.daily_loss_limit_pct,
+                "max_drawdown_pct": self.effective_cfg.max_drawdown_pct,
+                "max_open_positions": self.effective_cfg.max_open_positions,
                 "loop_interval_sec": self.cfg.loop_interval_sec,
+                # What the dashboard's Config tab actually renders for the
+                # tunable section -- the engine's own last-applied values,
+                # not a re-derivation, so it can never drift from reality.
+                "risk_profile": {
+                    "name": self._current_risk_profile_name,
+                    "effective": {f: getattr(self.effective_cfg, f) for f in RISK_PROFILE_TUNABLE_FIELDS},
+                },
             },
         }
         path = Path(self.cfg.state_file_path)
@@ -156,19 +185,25 @@ class Engine:
                 return False
         return True
 
-    def _known_client_order_ids(self) -> set:
+    def _known_client_order_ids(self, extra_symbols: Tuple[str, ...] = ()) -> set:
         """All client_order_ids we could plausibly have generated: today's
-        and yesterday's, for every whitelisted symbol and side, PLUS the
-        one-time core-satellite bootstrap ids (see core.py). Yesterday is
-        included so a tactical order submitted just before midnight UTC and
-        still open the next tick isn't mistaken for a stranger."""
+        and yesterday's, for every currently-whitelisted symbol and side
+        (core + current tactical universe, plus `extra_symbols` -- pass the
+        broker's currently-held position symbols here so a symbol that
+        rolled OUT of the tactical universe between refreshes but still has
+        an open order/position isn't mistaken for a stranger), PLUS the
+        one-time core-satellite bootstrap ids (see core.py, always tied to
+        the static core list only). Yesterday is included so a tactical
+        order submitted just before midnight UTC and still open the next
+        tick isn't mistaken for a stranger either."""
         from datetime import timedelta
 
         today = datetime.now(timezone.utc).date()
         yesterday = today - timedelta(days=1)
+        all_symbols = set(self.effective_cfg.symbols) | set(extra_symbols)
         ids = set()
         for d in (today, yesterday):
-            for symbol in self.cfg.symbols:
+            for symbol in all_symbols:
                 for side in ("buy", "sell"):
                     ids.add(f"pt-{symbol}-{side}-{d.isoformat()}")
         for symbol in self.cfg.symbols:
@@ -182,7 +217,7 @@ class Engine:
         if self._history_cache_date == today and self._history_cache:
             return
         fresh: Dict[str, List[float]] = {}
-        for symbol in self.cfg.symbols:
+        for symbol in self.effective_cfg.symbols:
             try:
                 fresh[symbol] = self.broker.recent_closes(symbol, self.cfg.history_lookback_days)
             except BrokerError as e:
@@ -190,6 +225,51 @@ class Engine:
         self._history_cache = fresh
         self._history_cache_date = today
         self._log("info", f"refreshed daily history cache for {list(fresh.keys())}")
+
+    # -- live risk profile + dynamic tactical universe -------------------------
+
+    def _build_effective_cfg(self):
+        """Fold the live-reloadable risk profile (safety.RiskProfileStore)
+        and the current dynamic tactical universe on top of the static,
+        frozen self.cfg loaded at startup. Re-derived fresh every tick --
+        neither source is cached, mirroring the kill switch's own "read the
+        file every tick" posture, and both fail closed to "no change from
+        self.cfg" on anything missing or malformed.
+
+        self.cfg itself is never mutated (still frozen, still the single
+        source of truth for locked fields); this always returns a NEW
+        Config via dataclasses.replace(). core.py's CoreAllocator is
+        deliberately constructed with -- and stays pinned to -- self.cfg
+        directly, never this, so core bootstrap sizing (tied to
+        len(cfg.symbols)) can never be affected by a profile switch or a
+        tactical universe refresh.
+        """
+        profile_state = self.risk_profile_store.load()
+        # Display-only fallback -- resolve() below correctly applies NOTHING
+        # when profile_state.profile is None, so effective_cfg still reflects
+        # self.cfg's own .env-configured values, not this cosmetic default.
+        self._current_risk_profile_name = profile_state.profile or DEFAULT_RISK_PROFILE
+        tactical_extra = self._load_tactical_universe()
+        effective_symbols = tuple(dict.fromkeys(list(self.cfg.symbols) + list(tactical_extra)))
+        return replace(self.cfg, symbols=effective_symbols, **profile_state.resolve())
+
+    def _load_tactical_universe(self) -> Tuple[str, ...]:
+        """The current weekly-refreshed satellite pool (see
+        scripts/refresh_tactical_universe.py), read fresh every tick. A
+        missing or malformed file just means zero extra tactical symbols --
+        this is purely additive on top of the static core self.cfg.symbols,
+        never a replacement for it, so failing closed here costs nothing
+        but upside (one tick without the newest satellite names)."""
+        try:
+            raw = json.loads(Path(self.cfg.tactical_universe_file_path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return ()
+        if not isinstance(raw, dict):
+            return ()
+        symbols = raw.get("symbols")
+        if not isinstance(symbols, list):
+            return ()
+        return tuple(s.strip().upper() for s in symbols if isinstance(s, str) and s.strip())
 
     # -- main tick --------------------------------------------------------------
 
@@ -230,6 +310,15 @@ class Engine:
         # resumed normally, since nothing else in this method resets it.
         self._halted = False
 
+        # 0. Fold the live risk profile + dynamic tactical universe on top
+        #    of the static self.cfg (see _build_effective_cfg). Done before
+        #    anything else so every step below -- including the kill-switch
+        #    and reconcile paths' own _write_state() calls -- sees a
+        #    consistent, freshly-computed self.effective_cfg.
+        self.effective_cfg = self._build_effective_cfg()
+        self.pre_trade.cfg = self.effective_cfg
+        self.circuit_breakers.cfg = self.effective_cfg
+
         # 1. Kill file check -- obeyed before anything else happens.
         if self.kill_switch.is_triggered():
             mode = self.kill_switch.mode()
@@ -263,7 +352,7 @@ class Engine:
         # 3. Reconcile: an order we don't recognize means something placed a
         #    trade outside this engine's own logic (a bug, a stale process,
         #    manual intervention) -- halt and let a human look.
-        if not self._reconcile(open_orders, self._known_client_order_ids()):
+        if not self._reconcile(open_orders, self._known_client_order_ids(extra_symbols=tuple(positions.keys()))):
             self.kill_switch.trigger(KillMode.HALT, "unrecognized open order during reconcile")
             self._halted = True
             notify.send_notification(
@@ -317,7 +406,7 @@ class Engine:
         self._refresh_history_if_needed()
 
         quotes = {}
-        for symbol in self.cfg.symbols:
+        for symbol in self.effective_cfg.symbols:
             try:
                 quotes[symbol] = self.broker.quote(symbol)
             except BrokerError as e:
@@ -330,18 +419,23 @@ class Engine:
         core_holdings = self.core.load()
 
         history = {}
-        for symbol in self.cfg.symbols:
+        for symbol in self.effective_cfg.symbols:
             cached = self._history_cache.get(symbol)
             quote = quotes.get(symbol)
             if cached is not None and quote is not None:
                 history[symbol] = cached + [quote.mid]
 
-        intents: List[OrderIntent] = propose(account, positions, quotes, history, self.cfg, core_holdings)
+        intents: List[OrderIntent] = propose(account, positions, quotes, history, self.effective_cfg, core_holdings)
 
         # 6 & 7. Validate then submit survivors, one at a time, with an
         # idempotency key. On any doubt about whether a submit "actually
         # happened," look it up by client_order_id instead of guessing.
         today = datetime.now(timezone.utc).date()
+        open_tactical_symbols = {
+            sym for sym, pos in positions.items()
+            if self.core.tactical_available_qty(sym, pos.qty) > 1e-9
+        }
+        approved_this_tick: set = set()
         for intent in intents:
             if self._is_same_day_round_trip(intent.symbol, intent.side, today):
                 self._log(
@@ -350,13 +444,36 @@ class Engine:
                     f"traded today -- refusing a same-day round trip",
                 )
                 continue
+            if intent.side == "buy" and self._would_exceed_open_positions(
+                intent.symbol, open_tactical_symbols, approved_this_tick, self.effective_cfg.max_open_positions
+            ):
+                self._log(
+                    "info",
+                    f"skipping buy for {intent.symbol}: at the {self.effective_cfg.max_open_positions}-position "
+                    f"tactical cap and {intent.symbol} isn't already open",
+                )
+                continue
             result = self.pre_trade.validate(intent, account, positions, quotes, open_orders, core_holdings)
             if not result.ok:
                 self._log("info", f"rejected intent for {intent.symbol} ({intent.side}): {result.reason}")
                 continue
+            if intent.side == "buy":
+                approved_this_tick.add(intent.symbol)
             self._submit_intent(intent)
 
         self._write_state(account, positions, open_orders, core_holdings=core_holdings)
+
+    def _would_exceed_open_positions(
+        self, symbol: str, open_tactical_symbols: set, approved_this_tick: set, cap: int
+    ) -> bool:
+        """True if buying `symbol` would open a NEW distinct tactical
+        position beyond `cap`. Adding to a symbol that's already tactically
+        open (or already approved earlier this same tick) never counts
+        against the cap -- this bounds how many DIFFERENT symbols the
+        tactical sleeve can hold at once, not the number of buy orders."""
+        if symbol in open_tactical_symbols or symbol in approved_this_tick:
+            return False
+        return len(open_tactical_symbols | approved_this_tick) >= cap
 
     def _is_same_day_round_trip(self, symbol: str, side: str, today) -> bool:
         """True if the OPPOSITE side already has an order today for this

@@ -19,6 +19,10 @@ runtime_state.json.tmp
 backtest_results.json
 walkforward_results.json
 core_holdings.json
+risk_profile.json
+risk_profile.json.tmp
+tactical_universe.json
+tactical_universe.json.tmp
 ml_model.joblib
 selftest_results.json
 notifications.json

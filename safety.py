@@ -23,6 +23,7 @@ quote/order snapshots the engine hands in.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import date
 from enum import Enum
@@ -88,6 +89,141 @@ class KillSwitch:
         (e.g. `rm HALT`) -- nothing in engine.py calls this automatically,
         since auto-clearing a kill condition would defeat the point of it."""
         self.path.unlink(missing_ok=True)
+
+
+# --------------------------------------------------------------------------
+# Risk profile (live-reloadable, dashboard-writable subset of Config)
+# --------------------------------------------------------------------------
+
+# Fields a risk profile preset or manual override is ever allowed to touch.
+# Deliberately narrow: risk-appetite dials only -- never account type, never
+# the symbol whitelist, never strategy identity, never the same-day
+# round-trip check (which has no backing Config field at all, so nothing
+# here could reach it even if it tried). core_allocation_pct is excluded on
+# purpose too: core.py treats it as a one-time bootstrap parameter tied to
+# len(cfg.symbols), not something safe to resize while the process runs.
+RISK_PROFILE_TUNABLE_FIELDS = (
+    "target_trade_usd",
+    "max_position_usd",
+    "max_concentration_pct",
+    "cash_buffer_usd",
+    "daily_loss_limit_pct",
+    "max_drawdown_pct",
+    "max_open_positions",
+)
+
+RISK_PROFILE_PRESETS: Dict[str, Dict[str, float]] = {
+    "conservative": {
+        "target_trade_usd": 15.0,
+        "max_position_usd": 40.0,
+        "max_concentration_pct": 0.25,
+        "cash_buffer_usd": 20.0,
+        "daily_loss_limit_pct": 0.02,
+        "max_drawdown_pct": 0.10,
+        "max_open_positions": 3,
+    },
+    "normal": {
+        "target_trade_usd": 25.0,
+        "max_position_usd": 60.0,
+        "max_concentration_pct": 0.35,
+        "cash_buffer_usd": 10.0,
+        "daily_loss_limit_pct": 0.03,
+        "max_drawdown_pct": 0.15,
+        "max_open_positions": 6,
+    },
+    "aggressive": {
+        "target_trade_usd": 40.0,
+        "max_position_usd": 90.0,
+        "max_concentration_pct": 0.50,
+        "cash_buffer_usd": 5.0,
+        "daily_loss_limit_pct": 0.05,
+        "max_drawdown_pct": 0.25,
+        "max_open_positions": 10,
+    },
+}
+
+DEFAULT_RISK_PROFILE = "normal"  # matches config.py's own field defaults -- display default only, see below
+
+
+@dataclass(frozen=True)
+class RiskProfileState:
+    """profile=None means "no risk-profile file yet, or it's unreadable" --
+    i.e. nobody has ever touched this dashboard control. resolve() returns
+    {} in that case, deliberately: self.cfg (whatever the operator actually
+    put in .env) must never be silently overwritten with a hardcoded
+    preset's numbers just because the profile file happens to be missing or
+    corrupt. A preset is ONLY ever applied once a human has explicitly
+    picked one (or an override) via the dashboard, which is what makes the
+    file exist with a valid profile name in the first place."""
+
+    profile: Optional[str]
+    overrides: Dict[str, float] = field(default_factory=dict)
+
+    def resolve(self) -> Dict[str, float]:
+        """Preset values merged with manual overrides -- overrides win.
+        Empty (no-op) if no profile has ever been explicitly selected."""
+        if self.profile is None:
+            return {}
+        resolved = dict(RISK_PROFILE_PRESETS[self.profile])
+        resolved.update(self.overrides)
+        return resolved
+
+
+class RiskProfileStore:
+    """Live-reloadable conservative/normal/aggressive profile plus manual
+    per-field overrides, mirroring KillSwitch's file-based pattern: a bare
+    Path, read fresh every tick, fail closed to "apply nothing" (see
+    RiskProfileState.profile=None above) on anything missing, unreadable,
+    or naming an unrecognized profile.
+
+    Unlike the kill file, this one is meant to be written by a human via the
+    dashboard, not just by the engine -- so the READER is the actual
+    enforcement point: any key outside RISK_PROFILE_TUNABLE_FIELDS, any
+    unrecognized profile name, or any non-numeric value is silently dropped
+    rather than applied. That makes this file structurally incapable of
+    ever touching a locked field, even from a hand-edited or corrupted copy.
+    """
+
+    def __init__(self, path: str):
+        self.path = Path(path)
+
+    def load(self) -> RiskProfileState:
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return RiskProfileState(profile=None)
+        if not isinstance(raw, dict):
+            return RiskProfileState(profile=None)
+
+        profile = raw.get("profile")
+        if profile not in RISK_PROFILE_PRESETS:
+            return RiskProfileState(profile=None)
+
+        overrides: Dict[str, float] = {}
+        raw_overrides = raw.get("overrides")
+        if isinstance(raw_overrides, dict):
+            for key, value in raw_overrides.items():
+                if key not in RISK_PROFILE_TUNABLE_FIELDS:
+                    continue
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    continue
+                overrides[key] = value
+
+        return RiskProfileState(profile=profile, overrides=overrides)
+
+    def write(self, profile: str, overrides: Optional[Dict[str, float]] = None) -> None:
+        """Atomic write (tmp + rename) -- a human may edit this via the
+        dashboard while the engine reads it every tick, so a torn read of a
+        half-written file should never be possible."""
+        if profile not in RISK_PROFILE_PRESETS:
+            raise ValueError(f"unknown risk profile {profile!r}")
+        clean_overrides = {
+            k: v for k, v in (overrides or {}).items() if k in RISK_PROFILE_TUNABLE_FIELDS
+        }
+        payload = {"profile": profile, "overrides": clean_overrides}
+        tmp_path = self.path.with_name(self.path.name + ".tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp_path.replace(self.path)
 
 
 # --------------------------------------------------------------------------
