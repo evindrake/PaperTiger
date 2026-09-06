@@ -2,10 +2,20 @@
 config.py -- a single frozen source of truth for every tunable knob.
 
 Loaded once from environment variables (via a .env file, see .env.example)
-into an immutable dataclass. "Frozen" is a deliberate safety choice: nothing
-downstream -- engine, strategy, safety checks -- can mutate config at
-runtime. If you want different behavior, change .env and restart; the code
-should never quietly rewrite its own risk limits while running.
+into an immutable dataclass. "Frozen" is a deliberate safety choice:
+nothing downstream -- engine, strategy, safety checks -- can mutate THIS
+object at runtime; a Config instance never changes after load_config()
+returns, and .env changes require a restart to take effect.
+
+The one deliberate exception, layered on top by engine.py (not by this
+file, and never by mutating a Config in place): a narrow, explicit,
+human-driven risk-profile override (see safety.RiskProfileStore) can
+substitute different values for a small allow-listed subset of fields --
+position sizing and circuit-breaker caps only -- on each tick, without a
+restart. See engine.Engine._build_effective_cfg. Everything else --
+symbols, account type, signal identity, and the same-day round-trip check
+-- has no override path at all; changing any of those still requires
+editing .env and restarting.
 
 guard_live() is the other safety-relevant piece here: it is the single
 choke point that decides whether this process is allowed to touch a live

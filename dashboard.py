@@ -10,17 +10,33 @@ convenience view, not something meant to be exposed on a network. Note that
 importing safety.KillSwitch here doesn't pull in alpaca-py or python-dotenv,
 so the "no pip install needed" property still holds.
 
-CRITICAL PROPERTY: this module cannot place an order, and cannot start,
-resume, or influence what the engine trades. It only reads
+CRITICAL PROPERTY: this module cannot place an order, cannot start or
+resume trading on its own, and cannot influence WHAT the engine trades
+(the symbol whitelist, the strategy, the account type) or WHETHER it
+trades a given signal at all. The one exception, scoped narrowly on
+purpose: it can adjust HOW MUCH/HOW WIDE (position sizing and circuit-
+breaker caps) via the Config tab's risk profile, described in point 2
+below. It only reads
 runtime_state.json / backtest_results.json / walkforward_results.json /
 selftest_results.json / equity_history.jsonl off disk and renders them,
-PLUS one narrow write path: the kill-switch buttons, which only ever
-create/update/remove the
-same local kill file engine.py and watchdog.py already read (see
-safety.KillSwitch). Clicking HALT or FLATTEN can only make the engine stop
-trading or liquidate to cash -- never place a new order -- and CLEAR only
-removes that stop condition, it never submits or authorizes a trade
-itself. There is no other code path from an HTTP request handled here to
+PLUS exactly two narrow write paths, both file-based, neither reachable
+from broker.py/engine.py's actual order-submission code:
+
+  1. The kill-switch buttons, which only ever create/update/remove the
+     same local kill file engine.py and watchdog.py already read (see
+     safety.KillSwitch). Clicking HALT or FLATTEN can only make the engine
+     stop trading or liquidate to cash -- never place a new order -- and
+     CLEAR only removes that stop condition, it never submits or
+     authorizes a trade itself.
+  2. The Config tab's risk-profile/override controls, which only ever
+     write risk_profile.json (see safety.RiskProfileStore), and are
+     allow-listed at the loader itself to exactly the 7 fields in
+     safety.RISK_PROFILE_TUNABLE_FIELDS (position sizing and circuit-
+     breaker caps). This can NEVER touch the symbol whitelist, the account
+     type, or the same-day round-trip check -- none of those have a
+     Config field this write path is even allowed to name.
+
+There is no other code path from an HTTP request handled here to
 broker.py, engine.py, or anything that touches Alpaca. If you're reviewing
 this file for safety, that's the invariant that matters most.
 
@@ -869,9 +885,17 @@ def _render_about_tab() -> str:
         set of textbook/experimental signals, not a bug to fix by tuning harder.</p>
 
         <p><strong>Core-satellite:</strong> because of that, a fixed fraction of seed capital is
-        permanently bought and held (never sold) across the symbol whitelist, so at least part of your
-        capital captures the market's long-run drift regardless of whether the tactical signal ever
+        permanently bought and held (never sold) across the core symbol whitelist, so at least part of
+        your capital captures the market's long-run drift regardless of whether the tactical signal ever
         finds a real edge.</p>
+
+        <p><strong>Risk profiles &amp; the tactical universe (see the Config tab):</strong> position
+        sizing and circuit-breaker caps can be switched between Conservative/Normal/Aggressive presets
+        (with manual overrides) live, without a restart -- but this can never touch the symbol whitelist,
+        the account type, or the same-day round-trip check below, since none of those have a
+        configurable backing at all. Separately, an optional weekly job can widen the tactical sleeve
+        with a small, liquidity-ranked pool of additional symbols on top of the static core list -- see
+        the Config tab's "Locked Configuration" section for what's currently active.</p>
 
         <p><strong>Not financial advice.</strong> No part of this project should be read as a
         recommendation to trade any particular security. See README.md for the full setup checklist,
@@ -881,7 +905,7 @@ def _render_about_tab() -> str:
 
 
 def _render_content() -> str:
-    """Everything that gets swapped on each auto-refresh -- all seven tab
+    """Everything that gets swapped on each auto-refresh -- all eight tab
     panels, with only the currently-selected one visible (client-side JS
     reapplies the selection after the swap, see showTab())."""
     state = _read_json(STATE_FILE)
@@ -901,6 +925,28 @@ def _render_content() -> str:
     '''
 
 
+# Hand-rolled inline SVG, same spirit as _svg_equity_curve() -- no external
+# image file, no CDN, so the "no pip install needed, no network dependency"
+# property of this file holds for the banner too. A rounded orange badge
+# with three clipped diagonal stripes -- a literal, unambiguous "tiger
+# stripes" mark that reads cleanly even at the small size it's shown at,
+# which a more detailed/naturalistic face would risk not doing.
+_PAPER_TIGER_MARK = '''
+    <svg class="banner-mark" width="48" height="48" viewBox="0 0 64 64" role="img" aria-label="PaperTiger logo">
+      <defs>
+        <clipPath id="ptBadgeClip"><rect x="4" y="4" width="56" height="56" rx="14" /></clipPath>
+      </defs>
+      <rect x="4" y="4" width="56" height="56" rx="14" fill="#f97316" />
+      <g clip-path="url(#ptBadgeClip)">
+        <polygon points="15,-4 21,-4 7,68 1,68" fill="#1f2229" />
+        <polygon points="29,-4 35,-4 21,68 15,68" fill="#1f2229" />
+        <polygon points="43,-4 49,-4 35,68 29,68" fill="#1f2229" />
+      </g>
+      <rect x="4" y="4" width="56" height="56" rx="14" fill="none" stroke="#1f2229" stroke-width="2" />
+    </svg>
+'''
+
+
 def _render_page() -> str:
     content = _render_content()
 
@@ -915,6 +961,11 @@ def _render_page() -> str:
   h2 {{ font-size: 15px; color: #9ca3af; margin-top: 32px; text-transform: uppercase; letter-spacing: 0.05em; }}
   h2:first-child {{ margin-top: 0; }}
   .subtitle {{ color: #6b7280; font-size: 13px; margin-bottom: 16px; }}
+  .banner {{ display: flex; align-items: center; gap: 16px; background: #1a1d24; border: 1px solid #2a2e37;
+             border-radius: 10px; padding: 14px 18px; margin-bottom: 8px; }}
+  .banner-mark {{ flex-shrink: 0; }}
+  .banner-text h1 {{ margin: 0; }}
+  .banner-text .subtitle {{ margin: 4px 0 0 0; }}
   .cards {{ display: flex; gap: 12px; flex-wrap: wrap; }}
   .card {{ background: #1a1d24; border: 1px solid #2a2e37; border-radius: 8px; padding: 12px 16px; min-width: 120px; }}
   .label {{ font-size: 11px; color: #9ca3af; text-transform: uppercase; }}
@@ -972,8 +1023,13 @@ def _render_page() -> str:
 </style>
 </head>
 <body>
-  <h1>PaperTiger</h1>
-  <div class="subtitle">This page cannot place orders -- the only write action it has is the kill switch, which can only stop or resume trading. Auto-refreshes every {REFRESH_SECONDS}s.</div>
+  <div class="banner">
+    {_PAPER_TIGER_MARK}
+    <div class="banner-text">
+      <h1>PaperTiger</h1>
+      <div class="subtitle">This page cannot place orders. Its only write actions are the kill switch (stop or resume trading) and the Config tab's risk profile/overrides (position sizing and risk caps only) -- neither can touch the symbol whitelist, the account type, or the same-day round-trip check. Auto-refreshes every {REFRESH_SECONDS}s.</div>
+    </div>
+  </div>
 
   <nav class="tabs">
     <button class="tab-btn active" data-tab="live" onclick="showTab('live')">Live</button>
@@ -1354,7 +1410,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 def run(host: str = "127.0.0.1", port: int = 8787) -> None:
     with socketserver.TCPServer((host, port), _Handler) as httpd:
-        print(f"[dashboard] serving on http://{host}:{port} (read-only, cannot place orders)")
+        print(f"[dashboard] serving on http://{host}:{port} (cannot place orders -- kill switch + risk-profile writes only)")
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:

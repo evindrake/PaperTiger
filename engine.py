@@ -6,14 +6,18 @@ a real (paper, by default) broker connection. The loop is intentionally
 linear and boring -- read the tick() method top to bottom and it tells you
 the entire safety story:
 
+    0. Fold in the live risk profile + dynamic tactical universe (see
+       _build_effective_cfg) -> everything below uses effective_cfg, never
+       the raw self.cfg, for anything risk/universe-related.
     1. Is the kill file present?            -> obey it, do nothing new.
     2. Pull truth from the broker.           -> broker is always authoritative.
     3. Reconcile against our own records.    -> a surprise order means HALT.
     4. Run circuit breakers on the numbers.  -> may escalate to FLATTEN/HALT.
     5. If the market's open, refresh history and ask strategy to propose.
-    6. Validate every proposal through PreTradeCheck.
-    7. Submit only the survivors, with an idempotency key.
-    8. Write a runtime_state.json snapshot, no matter what happened.
+    6. Filter same-day round trips and the max_open_positions cap.
+    7. Validate every remaining proposal through PreTradeCheck.
+    8. Submit only the survivors, with an idempotency key.
+    9. Write a runtime_state.json snapshot, no matter what happened.
 
 Any unhandled exception anywhere in a tick is caught at the very top level
 and treated as an error tick -- feeding the consecutive-error circuit

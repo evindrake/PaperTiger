@@ -9,8 +9,10 @@ easy to find in services.msc / Task Manager / Get-Service:
 
   - PaperTiger-Watchdog   (watchdog.py)  -- its ONLY power is creating the
     HALT kill file if the engine's heartbeat goes stale. Never trades.
-  - PaperTiger-Dashboard  (dashboard.py) -- read-only status page at
-    http://127.0.0.1:8787 plus a kill-switch control. Cannot place a trade.
+  - PaperTiger-Dashboard  (dashboard.py) -- status page at
+    http://127.0.0.1:8787 with a kill-switch control and a Config tab for
+    live risk-profile/sizing overrides. Cannot place a trade, and cannot
+    touch the symbol whitelist, account type, or round-trip check.
   - PaperTiger-Engine     (run.py)       -- the live (paper by default)
     trading loop.
 
@@ -96,7 +98,7 @@ Install-PtService -Name "PaperTiger-Watchdog" -ScriptFile "watchdog.py" `
 
 Install-PtService -Name "PaperTiger-Dashboard" -ScriptFile "dashboard.py" `
     -DisplayName "PaperTiger Dashboard" `
-    -Description "PaperTiger: status page at http://127.0.0.1:8787 with a kill-switch control. Cannot place a trade."
+    -Description "PaperTiger: status page at http://127.0.0.1:8787 with a kill-switch control and a Config tab for live risk-profile overrides. Cannot place a trade or touch the symbol whitelist."
 
 Install-PtService -Name "PaperTiger-Engine" -ScriptFile "run.py" `
     -DisplayName "PaperTiger Engine" `

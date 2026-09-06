@@ -26,9 +26,18 @@ Add-Type -AssemblyName System.Drawing
 
 $ProjectDir = Split-Path -Parent $PSScriptRoot
 $NotificationsFile = Join-Path $ProjectDir "notifications.json"
+$IconFile = Join-Path $PSScriptRoot "papertiger.ico"
 
 $icon = New-Object System.Windows.Forms.NotifyIcon
-$icon.Icon = [System.Drawing.SystemIcons]::Information
+if (Test-Path $IconFile) {
+    # Custom mark (orange badge, three diagonal stripes) -- see
+    # generate_tray_icon.ps1, which draws and writes this file. Falls back
+    # to the generic default below if it's ever missing, so this script
+    # never fails to start just because the icon hasn't been generated yet.
+    $icon.Icon = New-Object System.Drawing.Icon($IconFile)
+} else {
+    $icon.Icon = [System.Drawing.SystemIcons]::Information
+}
 $icon.Visible = $true
 $icon.Text = "PaperTiger"
 

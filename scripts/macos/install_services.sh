@@ -63,7 +63,7 @@ EOF
 install_persistent_agent "com.papertiger.watchdog" "watchdog.py" \
     "watchdog -- its ONLY power is creating the HALT kill file if the engine hangs. Never trades."
 install_persistent_agent "com.papertiger.dashboard" "dashboard.py" \
-    "status page at http://127.0.0.1:8787 with a kill-switch control. Cannot place a trade."
+    "status page at http://127.0.0.1:8787 with a kill-switch control and a Config tab for live risk-profile overrides. Cannot place a trade or touch the symbol whitelist."
 install_persistent_agent "com.papertiger.engine" "run.py" \
     "the live (paper by default) trading loop. Refuses to trade real money unless ALPACA_PAPER=false AND I_UNDERSTAND_THIS_IS_REAL_MONEY=yes are both set in .env."
 
