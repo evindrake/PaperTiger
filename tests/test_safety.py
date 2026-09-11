@@ -212,6 +212,20 @@ class TestKillSwitch(unittest.TestCase):
         ks.clear()
         self.assertFalse(ks.is_triggered())
 
+    def test_reason_reads_second_line(self):
+        ks = KillSwitch(self.path)
+        ks.trigger(KillMode.HALT, "consecutive tick errors exceeded threshold")
+        self.assertEqual(ks.reason(), "consecutive tick errors exceeded threshold")
+
+    def test_reason_none_when_absent(self):
+        ks = KillSwitch(self.path)
+        self.assertIsNone(ks.reason())
+
+    def test_reason_none_when_no_second_line(self):
+        Path(self.path).write_text("HALT", encoding="utf-8")
+        ks = KillSwitch(self.path)
+        self.assertIsNone(ks.reason())
+
 
 class TestRiskProfileStore(unittest.TestCase):
     def setUp(self):

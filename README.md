@@ -182,6 +182,20 @@ everything back to cash). The engine checks for this file every tick, and
 the watchdog will create it automatically if the engine's heartbeat goes
 stale.
 
+A HALT is otherwise always manual -- with one narrow, self-verifying
+exception. If the engine HALTs because `MAX_CONSECUTIVE_ERRORS` (default 3)
+ticks in a row all failed with the broker/API itself erroring out (Alpaca
+returning a 5xx, a timeout, etc. -- never a logic bug, an unrecognized
+order, or a circuit-breaker loss/drawdown trip, all of which still require
+you), it tags the HALT file accordingly and probes the broker once per tick
+from then on. The first failed probe logs a single line (not one every
+loop); the moment a probe actually succeeds, it clears the HALT itself,
+logs once, sends a notification, and resumes trading in that same tick --
+no waiting for the next scheduled loop, no manual `rm HALT`/`Remove-Item
+HALT` needed. Anything else -- a bug, a reconcile mismatch, a circuit
+breaker, or a HALT you triggered yourself from the dashboard or by hand --
+stays exactly as manual as ever.
+
 ## Files
 
 | File | Responsibility |
@@ -193,8 +207,8 @@ stale.
 | `core.py` | Core-satellite bootstrap: buys and permanently holds a fixed fraction of capital, equal-weight, never sold. |
 | `broker.py` | The *only* module that talks to Alpaca. Normalizes SDK objects into plain dataclasses. |
 | `strategy.py` | Thin, pure adapter: signal -> dollar-sized `OrderIntent`, aware of the core-satellite carve-out. Cannot place orders itself. |
-| `safety.py` | Kill switch, live-reloadable risk profile presets/overrides (`RiskProfileStore`), circuit breakers, pre-trade validation (including an independent core-carve-out guard). |
-| `engine.py` | The live loop: fold in risk profile + tactical universe -> kill check -> broker truth -> reconcile -> breakers -> core bootstrap -> propose -> round-trip/position-cap filter -> validate -> submit -> snapshot. |
+| `safety.py` | Kill switch (manual by design, with one self-verifying auto-clear exception for broker-connectivity HALTs -- see above), live-reloadable risk profile presets/overrides (`RiskProfileStore`), circuit breakers, pre-trade validation (including an independent core-carve-out guard). |
+| `engine.py` | The live loop: fold in risk profile + tactical universe -> kill check (auto-probes/resumes a broker-connectivity HALT, otherwise obeys it) -> broker truth -> reconcile -> breakers -> core bootstrap -> propose -> round-trip/position-cap filter -> validate -> submit -> snapshot. |
 | `watchdog.py` | Separate stdlib-only process. Its only power: creating the kill file if the engine's heartbeat goes stale. |
 | `backtest.py` | Offline simulator. Same caps as live, fills at next bar's open, buy-and-hold benchmark, core-satellite support. |
 | `walkforward.py` | Train/test parameter sweep + out-of-sample verdict, signal-agnostic (grid picked from `SIGNAL_KIND`). |
@@ -289,8 +303,9 @@ running OS, not the OS being off entirely.
 
 `notify.py` fires on engine HALT (consecutive errors, unrecognized order),
 FLATTEN (circuit breaker tripped), watchdog-triggered HALT (stale
-heartbeat), and any HALT/FLATTEN/CLEAR triggered manually from the
-dashboard's Kill Switch tab -- the events you'd otherwise only discover by
+heartbeat), auto-resume from a broker-connectivity HALT, and any
+HALT/FLATTEN/CLEAR triggered manually from the dashboard's Kill Switch tab
+-- the events you'd otherwise only discover by
 checking the dashboard. A dashboard-triggered HALT/FLATTEN also kicks off
 the full unit test suite in the background (results land on the Status
 tab a few seconds later), and the Status tab has a "Send Test

@@ -23,6 +23,16 @@ Any unhandled exception anywhere in a tick is caught at the very top level
 and treated as an error tick -- feeding the consecutive-error circuit
 breaker, which eventually HALTs. We never let "something went wrong that we
 didn't anticipate" turn into "so let's try again immediately."
+
+One narrow, verifiable exception to "an operator must intervene": if every
+error in that streak was the broker/API itself failing (BrokerError -- e.g.
+Alpaca returning 5xx), never a logic bug, a reconcile mismatch, or a
+circuit-breaker trip, the resulting HALT is tagged with
+safety.BROKER_CONNECTIVITY_HALT_REASON. Step 1 below probes the broker once
+per tick while that specific HALT is active and auto-clears it the moment a
+call actually succeeds -- "is the broker responding" is a fact the engine
+can check for itself, unlike the reason behind any other halt. Every other
+HALT/FLATTEN reason is still only ever cleared by a human.
 """
 
 from __future__ import annotations
@@ -43,6 +53,7 @@ import trade_log
 from broker import Broker, BrokerError, OrderView
 from core import CoreAllocator, core_client_order_id
 from safety import (
+    BROKER_CONNECTIVITY_HALT_REASON,
     DEFAULT_RISK_PROFILE,
     RISK_PROFILE_TUNABLE_FIELDS,
     BreakerAction,
@@ -88,6 +99,15 @@ class Engine:
         self._halted = False  # recomputed every tick in _tick_inner(); reflects
         # *this tick's* outcome, not a permanent latch -- the kill-switch file
         # (checked independently each tick) is what actually gates trading.
+        self._consecutive_broker_errors = 0  # in lockstep with
+        # circuit_breakers.state.consecutive_errors except it resets to 0 on
+        # any non-BrokerError exception, so at HALT time we can tell whether
+        # EVERY error in the streak was the broker/API itself failing (see
+        # BROKER_CONNECTIVITY_HALT_REASON) versus a mix that includes a real
+        # bug -- only the former is ever eligible for auto-recovery.
+        self._broker_halt_logged = False  # true once we've logged the first
+        # "still failing" line for the current broker-connectivity HALT, so
+        # the every-5-minutes retry probe doesn't spam the event log.
         self._market_open_prev: Optional[bool] = None  # None until the first
         # tick observes it -- lets us log only on open<->closed transitions
         # instead of every 5-minute tick overnight/weekends.
@@ -281,7 +301,8 @@ class Engine:
         try:
             self._tick_inner()
             self.circuit_breakers.record_success()
-        except Exception:
+            self._consecutive_broker_errors = 0
+        except Exception as exc:
             tb = traceback.format_exc()
             # Print to stderr FIRST, unconditionally -- this is the one
             # place that must never depend on anything else (the in-memory
@@ -291,14 +312,28 @@ class Engine:
             # sees if _write_state() itself is what's broken.
             print(f"[engine] unhandled exception in tick:\n{tb}", file=sys.stderr, flush=True)
             self._log("error", f"unhandled exception in tick: {tb}")
+            if isinstance(exc, BrokerError):
+                self._consecutive_broker_errors += 1
+            else:
+                self._consecutive_broker_errors = 0
             action = self.circuit_breakers.record_error()
             if action == BreakerAction.HALT:
-                self.kill_switch.trigger(KillMode.HALT, "consecutive tick errors exceeded threshold")
+                # Only tag this as auto-recoverable if EVERY error in the
+                # streak was a BrokerError -- a single non-broker exception
+                # anywhere in the streak permanently disqualifies it (see
+                # _consecutive_broker_errors above).
+                all_broker = self._consecutive_broker_errors == self.circuit_breakers.state.consecutive_errors
+                reason = BROKER_CONNECTIVITY_HALT_REASON if all_broker else "consecutive tick errors exceeded threshold"
+                self.kill_switch.trigger(KillMode.HALT, reason)
                 self._halted = True
+                self._broker_halt_logged = False
                 notify.send_notification(
                     self.cfg, "Engine HALTED: consecutive errors",
                     f"{self.circuit_breakers.state.consecutive_errors} consecutive tick errors -- "
-                    f"halted, no new entries. Latest error:\n{tb[-1500:]}",
+                    f"halted, no new entries. "
+                    + ("All were broker/API errors -- will auto-resume once the broker responds normally again. "
+                       if all_broker else "")
+                    + f"Latest error:\n{tb[-1500:]}",
                 )
             # Best-effort state write even on failure, so staleness is visible
             # rather than silent.
@@ -323,29 +358,65 @@ class Engine:
         self.pre_trade.cfg = self.effective_cfg
         self.circuit_breakers.cfg = self.effective_cfg
 
-        # 1. Kill file check -- obeyed before anything else happens.
+        # 1. Kill file check -- obeyed before anything else happens, with one
+        #    narrow, verifiable exception: a HALT this engine tagged
+        #    BROKER_CONNECTIVITY_HALT_REASON (every error in the streak that
+        #    caused it was the broker/API itself failing) is safe to probe
+        #    each tick and auto-clear the moment a broker call actually
+        #    succeeds -- see the module docstring and KillSwitch.clear().
+        #    Every other reason (an operator's own halt, a reconcile
+        #    mismatch, a circuit-breaker trip) is untouched by this branch.
         if self.kill_switch.is_triggered():
             mode = self.kill_switch.mode()
-            self._halted = True
-            account = positions = open_orders = None
-            try:
-                account = self.broker.account()
-                positions = self.broker.positions()
-                open_orders = self.broker.open_orders()
-            except BrokerError as e:
-                self._log("error", f"kill-file active but could not fetch broker state: {e}")
+            reason = self.kill_switch.reason()
+            auto_recovered = False
 
-            if mode == KillMode.FLATTEN:
-                self._log("warn", "kill switch in FLATTEN mode -- liquidating to cash")
+            if mode == KillMode.HALT and reason == BROKER_CONNECTIVITY_HALT_REASON:
                 try:
-                    self.broker.flatten_everything()
+                    self.broker.account()
                 except BrokerError as e:
-                    self._log("error", f"flatten_everything failed: {e}")
-            else:
-                self._log("info", "kill switch in HALT mode -- holding, no new entries")
+                    self._halted = True
+                    if not self._broker_halt_logged:
+                        self._log("info", f"halted on broker/API errors -- probing each tick, still failing: {e}")
+                        self._broker_halt_logged = True
+                    self._write_state(kill_mode=mode)
+                    return
+                else:
+                    self.kill_switch.clear()
+                    self.circuit_breakers.state.consecutive_errors = 0
+                    self._consecutive_broker_errors = 0
+                    self._broker_halt_logged = False
+                    auto_recovered = True
+                    self._log("info", "broker/API connectivity recovered -- auto-resuming")
+                    notify.send_notification(
+                        self.cfg, "Engine auto-resumed",
+                        "Broker/API connectivity recovered after a consecutive-error HALT -- "
+                        "resuming normal operation automatically.",
+                    )
 
-            self._write_state(account, positions, open_orders, kill_mode=mode)
-            return
+            if not auto_recovered:
+                self._halted = True
+                account = positions = open_orders = None
+                try:
+                    account = self.broker.account()
+                    positions = self.broker.positions()
+                    open_orders = self.broker.open_orders()
+                except BrokerError as e:
+                    self._log("error", f"kill-file active but could not fetch broker state: {e}")
+
+                if mode == KillMode.FLATTEN:
+                    self._log("warn", "kill switch in FLATTEN mode -- liquidating to cash")
+                    try:
+                        self.broker.flatten_everything()
+                    except BrokerError as e:
+                        self._log("error", f"flatten_everything failed: {e}")
+                else:
+                    self._log("info", "kill switch in HALT mode -- holding, no new entries")
+
+                self._write_state(account, positions, open_orders, kill_mode=mode)
+                return
+            # else: fall through into the normal tick flow below (steps 2-9)
+            # immediately, rather than waiting for the next scheduled tick.
 
         # 2. Pull truth from the broker. The broker's view always wins over
         #    any local assumption about what should be true.
@@ -555,5 +626,12 @@ class Engine:
         while True:
             self.tick()
             if self._halted:
-                self._log("info", "engine halted -- sleeping, but not exiting (an operator must intervene)")
+                # Skip this heartbeat entirely while probing a broker-
+                # connectivity HALT -- step 1 already logs "still failing"
+                # once per failure, and "an operator must intervene" would
+                # be actively wrong here (no one needs to; it's retrying
+                # itself). Every other halt reason keeps logging every tick,
+                # unchanged from before.
+                if self.kill_switch.reason() != BROKER_CONNECTIVITY_HALT_REASON:
+                    self._log("info", "engine halted -- sleeping, but not exiting (an operator must intervene)")
             time.sleep(self.cfg.loop_interval_sec)

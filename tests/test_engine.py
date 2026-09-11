@@ -14,10 +14,10 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from broker import AccountSnapshot, OrderView, Position, Quote
+from broker import AccountSnapshot, BrokerError, OrderView, Position, Quote
 from config import Config
 from engine import Engine
-from safety import KillMode, KillSwitch
+from safety import BROKER_CONNECTIVITY_HALT_REASON, KillMode, KillSwitch
 
 
 class FakeBroker:
@@ -36,8 +36,11 @@ class FakeBroker:
         self.submitted_buys = []
         self.submitted_sells = []
         self._orders_by_cid = {}  # client_order_id -> OrderView, for simulating pre-existing orders
+        self.fail_account_with = None  # set to an Exception to make account() raise it
 
     def account(self):
+        if self.fail_account_with is not None:
+            raise self.fail_account_with
         return AccountSnapshot(
             cash=self._cash, equity=self._equity, buying_power=self._buying_power,
             last_equity=self._equity, multiplier=1.0, shorting_enabled=False,
@@ -366,6 +369,118 @@ class TestEngineTick(unittest.TestCase):
 
         reopened_events = [e for e in engine._events if e["message"] == "market reopened"]
         self.assertEqual(len(reopened_events), 1)
+
+
+class TestBrokerConnectivityAutoRecovery(unittest.TestCase):
+    """A HALT caused entirely by the broker/API failing (e.g. Alpaca 5xx)
+    is the one kill condition the engine is allowed to clear itself, and
+    only once a broker call actually succeeds again. Every other halt
+    reason must stay exactly as sticky as before."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def test_all_broker_errors_halts_with_recoverable_reason(self):
+        cfg = make_cfg(self.tmpdir, max_consecutive_errors=3)
+        fake = FakeBroker()
+        fake.fail_account_with = BrokerError("500 Internal Server Error")
+        engine = Engine(cfg, broker=fake)
+
+        engine.tick()
+        engine.tick()
+        self.assertFalse(engine.kill_switch.is_triggered())  # not yet at threshold
+        engine.tick()
+
+        self.assertTrue(engine.kill_switch.is_triggered())
+        self.assertEqual(engine.kill_switch.mode(), KillMode.HALT)
+        self.assertEqual(engine.kill_switch.reason(), BROKER_CONNECTIVITY_HALT_REASON)
+
+    def test_auto_resumes_once_broker_recovers(self):
+        cfg = make_cfg(self.tmpdir)
+        fake = FakeBroker()
+        fake.fail_account_with = BrokerError("500 Internal Server Error")
+        fake._closes["SPY"] = [float(i) for i in range(1, 21)]  # uptrend, ready to buy on resume
+        engine = Engine(cfg, broker=fake)
+
+        for _ in range(cfg.max_consecutive_errors):
+            engine.tick()
+        self.assertTrue(engine.kill_switch.is_triggered())
+
+        fake.fail_account_with = None  # broker is healthy again
+        engine.tick()
+
+        self.assertFalse(engine.kill_switch.is_triggered())
+        self.assertFalse(engine._halted)
+        # Recovery falls through into the same tick's normal flow rather
+        # than waiting for the next loop_interval_sec.
+        self.assertEqual(len(fake.submitted_buys), 1)
+
+    def test_still_failing_probe_logs_only_once(self):
+        cfg = make_cfg(self.tmpdir)
+        fake = FakeBroker()
+        fake.fail_account_with = BrokerError("500 Internal Server Error")
+        engine = Engine(cfg, broker=fake)
+
+        for _ in range(cfg.max_consecutive_errors):
+            engine.tick()
+        self.assertTrue(engine.kill_switch.is_triggered())
+
+        engine.tick()
+        engine.tick()
+        engine.tick()
+
+        still_failing = [e for e in engine._events if "still failing" in e["message"]]
+        self.assertEqual(len(still_failing), 1)
+
+    def test_non_broker_error_is_not_auto_recoverable(self):
+        cfg = make_cfg(self.tmpdir)
+        fake = FakeBroker()
+        engine = Engine(cfg, broker=fake)
+
+        # Simulate a real bug (not a BrokerError) on every tick.
+        fake.positions = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        for _ in range(cfg.max_consecutive_errors):
+            engine.tick()
+
+        self.assertTrue(engine.kill_switch.is_triggered())
+        self.assertNotEqual(engine.kill_switch.reason(), BROKER_CONNECTIVITY_HALT_REASON)
+
+        # Fix the bug -- the engine must NOT auto-clear a non-broker halt,
+        # even though the broker itself would now respond fine.
+        fake.positions = lambda: {}
+        engine.tick()
+
+        self.assertTrue(engine.kill_switch.is_triggered())
+
+    def test_mixed_error_streak_is_not_auto_recoverable(self):
+        # One non-broker exception anywhere in the streak permanently
+        # disqualifies that HALT from auto-recovery, even if the rest of
+        # the streak was pure broker errors.
+        cfg = make_cfg(self.tmpdir)
+        fake = FakeBroker()
+        engine = Engine(cfg, broker=fake)
+
+        fake.positions = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        engine.tick()
+        fake.fail_account_with = BrokerError("500 Internal Server Error")
+        fake.positions = lambda: {}
+        engine.tick()
+        engine.tick()
+
+        self.assertTrue(engine.kill_switch.is_triggered())
+        self.assertNotEqual(engine.kill_switch.reason(), BROKER_CONNECTIVITY_HALT_REASON)
+
+    def test_manual_halt_is_never_auto_cleared_even_if_broker_is_healthy(self):
+        cfg = make_cfg(self.tmpdir)
+        fake = FakeBroker()
+        KillSwitch(cfg.kill_file_path).trigger(KillMode.HALT, "manual test halt")
+
+        engine = Engine(cfg, broker=fake)
+        engine.tick()
+        engine.tick()
+
+        self.assertTrue(engine.kill_switch.is_triggered())
+        self.assertEqual(engine.kill_switch.reason(), "manual test halt")
 
 
 if __name__ == "__main__":

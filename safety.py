@@ -37,6 +37,16 @@ from strategy import OrderIntent
 # Kill switch
 # --------------------------------------------------------------------------
 
+# The exact reason string engine.py writes when it HALTs itself because every
+# error in the consecutive-error streak was a BrokerError (the broker/API
+# itself failing -- e.g. Alpaca returning 5xx), never a logic bug, a
+# reconcile mismatch, or a circuit-breaker equity trip. engine.py checks for
+# this exact string as the sole trigger for its one auto-clear exception
+# (see KillSwitch.clear()) -- a HALT written with any other reason, including
+# an operator's own note, is never auto-cleared.
+BROKER_CONNECTIVITY_HALT_REASON = "consecutive tick errors exceeded threshold (broker/API connectivity)"
+
+
 class KillMode(Enum):
     """HALT: stop opening new positions, hold what we have, keep reporting.
     FLATTEN: cancel all open orders and market-sell every position back to
@@ -79,6 +89,19 @@ class KillSwitch:
             return KillMode.FLATTEN
         return KillMode.HALT
 
+    def reason(self) -> Optional[str]:
+        """The second line of the kill file, if any -- the free-text reason
+        passed to trigger(). None if the file is absent, unreadable, or has
+        no second line."""
+        if not self.path.exists():
+            return None
+        try:
+            contents = self.path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        lines = contents.strip("\n").splitlines()
+        return lines[1].strip() if len(lines) > 1 else None
+
     def trigger(self, mode: KillMode, reason: str) -> None:
         """Create (or overwrite) the kill file. Idempotent -- calling this
         repeatedly with the same mode is harmless."""
@@ -87,7 +110,14 @@ class KillSwitch:
     def clear(self) -> None:
         """Remove the kill file. This is a manual, operator-driven action
         (e.g. `rm HALT`) -- nothing in engine.py calls this automatically,
-        since auto-clearing a kill condition would defeat the point of it."""
+        with exactly one narrow exception: a HALT engine.py wrote itself with
+        reason BROKER_CONNECTIVITY_HALT_REASON (every error in the streak was
+        the broker/API failing, not a logic bug or an operator's own halt)
+        gets auto-cleared once a broker call actually succeeds again, since
+        "is the broker responding" is an externally verifiable fact rather
+        than a guess that it's safe to keep going. Every other kill file --
+        including a HALT with any other reason -- is never touched by
+        anything but this method, called by a human."""
         self.path.unlink(missing_ok=True)
 
 
