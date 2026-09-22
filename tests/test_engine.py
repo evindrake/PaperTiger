@@ -290,6 +290,26 @@ class TestEngineTick(unittest.TestCase):
         # so the cap should let the first two through and skip the third.
         self.assertEqual(bought_symbols, {"AAA", "BBB"})
 
+    def test_cap_skipped_symbols_are_batched_into_one_summary_line(self):
+        # Regression test: this used to log one "skipping buy for X" line
+        # per symbol still waiting for a slot -- with a wide tactical
+        # universe and a tight cap, that's most of the event log on every
+        # idle tick. It must now be a single summary line per tick.
+        cfg = make_cfg(self.tmpdir, symbols=("AAA", "BBB", "CCC", "DDD"), max_open_positions=1)
+        fake = FakeBroker()
+        for sym in cfg.symbols:
+            fake._closes[sym] = [float(i) for i in range(1, 21)]  # uptrend on all four
+
+        engine = Engine(cfg, broker=fake)
+        engine.tick()
+
+        skip_events = [e for e in engine._events if "tactical cap" in e["message"]]
+        self.assertEqual(len(skip_events), 1)
+        self.assertIn("BBB", skip_events[0]["message"])
+        self.assertIn("CCC", skip_events[0]["message"])
+        self.assertIn("DDD", skip_events[0]["message"])
+        self.assertNotIn("AAA", skip_events[0]["message"])  # AAA was bought, not skipped
+
     def test_max_open_positions_does_not_block_sells_of_already_open_symbols(self):
         # The cap only ever gates opening a NEW distinct tactical symbol --
         # it must never block a sell signal on a symbol already held.

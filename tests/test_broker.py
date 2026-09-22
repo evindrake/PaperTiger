@@ -17,7 +17,9 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from broker import Broker, TradableAsset, _round_to_tick
+import requests
+
+from broker import Broker, BrokerError, TradableAsset, _round_to_tick
 
 
 class TestRoundToTick(unittest.TestCase):
@@ -60,6 +62,7 @@ class _FakeTradingClient:
         self.last_request = None
         self.last_assets_filter = None
         self.assets_to_return = []
+        self.get_account_raises = None
 
     def submit_order(self, order_data):
         self.last_request = order_data
@@ -68,6 +71,11 @@ class _FakeTradingClient:
     def get_all_assets(self, filter=None):
         self.last_assets_filter = filter
         return list(self.assets_to_return)
+
+    def get_account(self):
+        if self.get_account_raises is not None:
+            raise self.get_account_raises
+        raise AssertionError("test must set get_account_raises before calling account()")
 
 
 def make_broker():
@@ -127,6 +135,32 @@ class TestListTradableUsEquities(unittest.TestCase):
         # get_all_assets was called with a filter object, once -- confirms
         # this doesn't loop per-symbol under the hood.
         self.assertIsNotNone(broker._trading.last_assets_filter)
+
+
+class TestNetworkFailuresAreWrappedAsBrokerError(unittest.TestCase):
+    """Regression test: a DNS/connection-level failure (e.g. a Wi-Fi/VPN
+    blip) raises a raw requests exception, not alpaca's APIError, since it
+    happens before any HTTP response comes back. Every broker.py method must
+    still turn that into BrokerError -- engine.py's auto-recovery logic
+    (see engine.tick()) only treats a HALT as auto-clearable when every
+    error in the streak was a BrokerError, so a network exception that
+    leaks through unwrapped would silently fall back to requiring a manual
+    clear, exactly defeating the point."""
+
+    def test_dns_failure_becomes_broker_error(self):
+        broker = make_broker()
+        broker._trading.get_account_raises = requests.exceptions.ConnectionError(
+            "HTTPSConnectionPool(host='paper-api.alpaca.markets', port=443): "
+            "Max retries exceeded (Caused by NameResolutionError(...))"
+        )
+        with self.assertRaises(BrokerError):
+            broker.account()
+
+    def test_timeout_becomes_broker_error(self):
+        broker = make_broker()
+        broker._trading.get_account_raises = requests.exceptions.Timeout("read timed out")
+        with self.assertRaises(BrokerError):
+            broker.account()
 
 
 if __name__ == "__main__":

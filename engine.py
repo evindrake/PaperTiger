@@ -511,6 +511,11 @@ class Engine:
             if self.core.tactical_available_qty(sym, pos.qty) > 1e-9
         }
         approved_this_tick: set = set()
+        cap_skipped_symbols: List[str] = []  # batched into one summary line
+        # below instead of one log line per symbol -- with a full tactical
+        # universe and a tight cap, every idle tick could otherwise log one
+        # line per candidate still waiting for a slot, every 5 minutes,
+        # crowding out everything else in the event ring buffer.
         for intent in intents:
             if self._is_same_day_round_trip(intent.symbol, intent.side, today):
                 self._log(
@@ -522,11 +527,7 @@ class Engine:
             if intent.side == "buy" and self._would_exceed_open_positions(
                 intent.symbol, open_tactical_symbols, approved_this_tick, self.effective_cfg.max_open_positions
             ):
-                self._log(
-                    "info",
-                    f"skipping buy for {intent.symbol}: at the {self.effective_cfg.max_open_positions}-position "
-                    f"tactical cap and {intent.symbol} isn't already open",
-                )
+                cap_skipped_symbols.append(intent.symbol)
                 continue
             result = self.pre_trade.validate(intent, account, positions, quotes, open_orders, core_holdings)
             if not result.ok:
@@ -535,6 +536,13 @@ class Engine:
             if intent.side == "buy":
                 approved_this_tick.add(intent.symbol)
             self._submit_intent(intent)
+
+        if cap_skipped_symbols:
+            self._log(
+                "info",
+                f"skipping {len(cap_skipped_symbols)} buy(s) at the {self.effective_cfg.max_open_positions}-position "
+                f"tactical cap (already full): {', '.join(cap_skipped_symbols)}",
+            )
 
         self._write_state(account, positions, open_orders, core_holdings=core_holdings)
 

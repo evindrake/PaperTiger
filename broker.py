@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Dict, List, Optional
 
+import requests
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical.stock import StockHistoricalDataClient
@@ -199,7 +200,7 @@ class Broker:
     def account(self) -> AccountSnapshot:
         try:
             acct = self._trading.get_account()
-        except APIError as e:
+        except (APIError, requests.exceptions.RequestException) as e:
             raise BrokerError(f"get_account failed: {e}") from e
         return AccountSnapshot(
             cash=_to_float(acct.cash),
@@ -217,7 +218,7 @@ class Broker:
     def positions(self) -> Dict[str, Position]:
         try:
             raw_positions = self._trading.get_all_positions()
-        except APIError as e:
+        except (APIError, requests.exceptions.RequestException) as e:
             raise BrokerError(f"get_all_positions failed: {e}") from e
         result: Dict[str, Position] = {}
         for p in raw_positions:
@@ -236,14 +237,14 @@ class Broker:
             raw_orders = self._trading.get_orders(
                 filter=GetOrdersRequest(status=QueryOrderStatus.OPEN)
             )
-        except APIError as e:
+        except (APIError, requests.exceptions.RequestException) as e:
             raise BrokerError(f"get_orders(open) failed: {e}") from e
         return [self._normalize_order(o) for o in raw_orders]
 
     def order_by_client_id(self, client_order_id: str) -> Optional[OrderView]:
         try:
             order = self._trading.get_order_by_client_id(client_order_id)
-        except APIError as e:
+        except (APIError, requests.exceptions.RequestException) as e:
             if e.status_code == 404:
                 return None
             raise BrokerError(f"get_order_by_client_id failed: {e}") from e
@@ -269,7 +270,7 @@ class Broker:
     def market_open(self) -> bool:
         try:
             clock = self._trading.get_clock()
-        except APIError as e:
+        except (APIError, requests.exceptions.RequestException) as e:
             raise BrokerError(f"get_clock failed: {e}") from e
         return bool(clock.is_open)
 
@@ -278,7 +279,7 @@ class Broker:
             quotes = self._data.get_stock_latest_quote(
                 StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX)
             )
-        except APIError as e:
+        except (APIError, requests.exceptions.RequestException) as e:
             raise BrokerError(f"get_stock_latest_quote({symbol}) failed: {e}") from e
         q = quotes.get(symbol)
         if q is None:
@@ -304,7 +305,7 @@ class Broker:
                     feed=DataFeed.IEX,
                 )
             )
-        except APIError as e:
+        except (APIError, requests.exceptions.RequestException) as e:
             raise BrokerError(f"get_stock_bars({symbol}) failed: {e}") from e
 
         bar_list = bars.data.get(symbol, [])
@@ -326,7 +327,7 @@ class Broker:
                     feed=DataFeed.IEX,
                 )
             )
-        except APIError as e:
+        except (APIError, requests.exceptions.RequestException) as e:
             raise BrokerError(f"get_stock_bars({symbol}) failed: {e}") from e
 
         bar_list = bar_set.data.get(symbol, [])
@@ -388,7 +389,7 @@ class Broker:
     def _submit(self, request: LimitOrderRequest) -> OrderView:
         try:
             order = self._trading.submit_order(order_data=request)
-        except APIError as e:
+        except (APIError, requests.exceptions.RequestException) as e:
             # An ambiguous submit (e.g. timeout) should NOT be retried blindly
             # here -- engine.py is responsible for resolving ambiguity via
             # order_by_client_id() before deciding whether to try again.
@@ -398,7 +399,7 @@ class Broker:
     def cancel_all_orders(self) -> None:
         try:
             self._trading.cancel_orders()
-        except APIError as e:
+        except (APIError, requests.exceptions.RequestException) as e:
             raise BrokerError(f"cancel_orders failed: {e}") from e
 
     def flatten_everything(self) -> None:
@@ -408,7 +409,7 @@ class Broker:
         operator kill files."""
         try:
             self._trading.close_all_positions(cancel_orders=True)
-        except APIError as e:
+        except (APIError, requests.exceptions.RequestException) as e:
             raise BrokerError(f"close_all_positions failed: {e}") from e
 
     # -- asset metadata (used by preflight.py) --------------------------------
@@ -416,7 +417,7 @@ class Broker:
     def asset(self, symbol: str) -> AssetView:
         try:
             a = self._trading.get_asset(symbol)
-        except APIError as e:
+        except (APIError, requests.exceptions.RequestException) as e:
             raise BrokerError(f"get_asset({symbol}) failed: {e}") from e
         status = a.status.value if hasattr(a.status, "value") else str(a.status)
         return AssetView(
@@ -439,7 +440,7 @@ class Broker:
             assets = self._trading.get_all_assets(
                 GetAssetsRequest(status=AssetStatus.ACTIVE, asset_class=AssetClass.US_EQUITY)
             )
-        except APIError as e:
+        except (APIError, requests.exceptions.RequestException) as e:
             raise BrokerError(f"get_all_assets failed: {e}") from e
         return [
             TradableAsset(

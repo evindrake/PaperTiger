@@ -184,10 +184,11 @@ stale.
 
 A HALT is otherwise always manual -- with one narrow, self-verifying
 exception. If the engine HALTs because `MAX_CONSECUTIVE_ERRORS` (default 3)
-ticks in a row all failed with the broker/API itself erroring out (Alpaca
-returning a 5xx, a timeout, etc. -- never a logic bug, an unrecognized
-order, or a circuit-breaker loss/drawdown trip, all of which still require
-you), it tags the HALT file accordingly and probes the broker once per tick
+ticks in a row all failed with the broker/API itself erroring out -- Alpaca
+returning a 5xx, a timeout, or a local network/DNS blip (e.g. Wi-Fi or VPN
+dropping briefly) -- never a logic bug, an unrecognized order, or a
+circuit-breaker loss/drawdown trip, all of which still require you -- it
+tags the HALT file accordingly and probes the broker once per tick
 from then on. The first failed probe logs a single line (not one every
 loop); the moment a probe actually succeeds, it clears the HALT itself,
 logs once, sends a notification, and resumes trading in that same tick --
@@ -205,7 +206,7 @@ stays exactly as manual as ever.
 | `ml_signal.py` | Feature engineering + model loading for the experimental `ml_classifier` signal. The one deliberate exception to `signals.py`'s "no I/O" rule. |
 | `train_ml_signal.py` | Trains the scikit-learn model `ml_signal.py` loads, with a chronological (never shuffled) train/test split. |
 | `core.py` | Core-satellite bootstrap: buys and permanently holds a fixed fraction of capital, equal-weight, never sold. |
-| `broker.py` | The *only* module that talks to Alpaca. Normalizes SDK objects into plain dataclasses. |
+| `broker.py` | The *only* module that talks to Alpaca. Normalizes SDK objects into plain dataclasses; every call site raises `BrokerError` uniformly, whether the failure was Alpaca's API itself or the underlying network (DNS, timeout, connection refused). |
 | `strategy.py` | Thin, pure adapter: signal -> dollar-sized `OrderIntent`, aware of the core-satellite carve-out. Cannot place orders itself. |
 | `safety.py` | Kill switch (manual by design, with one self-verifying auto-clear exception for broker-connectivity HALTs -- see above), live-reloadable risk profile presets/overrides (`RiskProfileStore`), circuit breakers, pre-trade validation (including an independent core-carve-out guard). |
 | `engine.py` | The live loop: fold in risk profile + tactical universe -> kill check (auto-probes/resumes a broker-connectivity HALT, otherwise obeys it) -> broker truth -> reconcile -> breakers -> core bootstrap -> propose -> round-trip/position-cap filter -> validate -> submit -> snapshot. |
