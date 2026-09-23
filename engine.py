@@ -111,6 +111,12 @@ class Engine:
         self._market_open_prev: Optional[bool] = None  # None until the first
         # tick observes it -- lets us log only on open<->closed transitions
         # instead of every 5-minute tick overnight/weekends.
+        self._cap_skip_logged: Optional[Tuple[date, frozenset]] = None  # the
+        # (day, symbol-set) of the last "skipping buy(s) at the tactical
+        # cap" summary we logged -- at most one per day per distinct set of
+        # skipped symbols, so a cap that's simply staying full all day
+        # doesn't re-announce itself every 5 minutes. Logs again the moment
+        # the actual set of skipped symbols changes, even same-day.
 
     # -- event log / state snapshot ----------------------------------------
 
@@ -538,11 +544,14 @@ class Engine:
             self._submit_intent(intent)
 
         if cap_skipped_symbols:
-            self._log(
-                "info",
-                f"skipping {len(cap_skipped_symbols)} buy(s) at the {self.effective_cfg.max_open_positions}-position "
-                f"tactical cap (already full): {', '.join(cap_skipped_symbols)}",
-            )
+            cap_skip_key = (today, frozenset(cap_skipped_symbols))
+            if cap_skip_key != self._cap_skip_logged:
+                self._cap_skip_logged = cap_skip_key
+                self._log(
+                    "info",
+                    f"skipping {len(cap_skipped_symbols)} buy(s) at the {self.effective_cfg.max_open_positions}-position "
+                    f"tactical cap (already full): {', '.join(cap_skipped_symbols)}",
+                )
 
         self._write_state(account, positions, open_orders, core_holdings=core_holdings)
 

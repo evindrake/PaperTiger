@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from broker import AccountSnapshot, BrokerError, OrderView, Position, Quote
 from config import Config
 from engine import Engine
-from safety import BROKER_CONNECTIVITY_HALT_REASON, KillMode, KillSwitch
+from safety import BROKER_CONNECTIVITY_HALT_REASON, KillMode, KillSwitch, RiskProfileStore
 
 
 class FakeBroker:
@@ -309,6 +309,43 @@ class TestEngineTick(unittest.TestCase):
         self.assertIn("CCC", skip_events[0]["message"])
         self.assertIn("DDD", skip_events[0]["message"])
         self.assertNotIn("AAA", skip_events[0]["message"])  # AAA was bought, not skipped
+
+    def test_cap_skip_summary_does_not_repeat_same_day_unchanged(self):
+        # Even the single batched line shouldn't repeat every 5 minutes if
+        # the set of symbols stuck behind the cap hasn't actually changed --
+        # at most one per day per distinct set (see engine._cap_skip_logged).
+        cfg = make_cfg(self.tmpdir, symbols=("AAA", "BBB", "CCC", "DDD"), max_open_positions=1)
+        fake = FakeBroker()
+        for sym in cfg.symbols:
+            fake._closes[sym] = [float(i) for i in range(1, 21)]
+
+        engine = Engine(cfg, broker=fake)
+        engine.tick()
+        engine.tick()
+        engine.tick()
+
+        skip_events = [e for e in engine._events if "tactical cap" in e["message"]]
+        self.assertEqual(len(skip_events), 1)
+
+    def test_cap_skip_summary_relogs_when_the_skipped_set_changes(self):
+        cfg = make_cfg(self.tmpdir, symbols=("AAA", "BBB", "CCC", "DDD"), max_open_positions=1)
+        fake = FakeBroker()
+        for sym in cfg.symbols:
+            fake._closes[sym] = [float(i) for i in range(1, 21)]
+
+        engine = Engine(cfg, broker=fake)
+        engine.tick()  # cap=1 -> skips BBB, CCC, DDD
+
+        # Raise the cap live via a risk-profile override (the dashboard's
+        # own mechanism) -- a genuinely different skipped set, same day.
+        RiskProfileStore(cfg.risk_profile_file_path).write("normal", {"max_open_positions": 2})
+        engine.tick()  # cap=2 -> skips CCC, DDD only
+
+        skip_events = [e for e in engine._events if "tactical cap" in e["message"]]
+        self.assertEqual(len(skip_events), 2)
+        self.assertIn("BBB", skip_events[0]["message"])
+        self.assertIn("DDD", skip_events[1]["message"])
+        self.assertNotIn("BBB", skip_events[1]["message"])
 
     def test_max_open_positions_does_not_block_sells_of_already_open_symbols(self):
         # The cap only ever gates opening a NEW distinct tactical symbol --
