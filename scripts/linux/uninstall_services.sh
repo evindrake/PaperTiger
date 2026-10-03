@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # uninstall_services.sh -- removes everything install_services.sh set up:
 # the systemd --user services/timers for PaperTiger's watchdog, dashboard,
-# engine, daily retrain, weekly tactical universe refresh, self-test, and
+# engine, daily retrain, weekly candidate-stock re-ranking, self-test, and
 # desktop notifier.
 #
 # This only removes the SERVICE REGISTRATIONS -- it does not touch any

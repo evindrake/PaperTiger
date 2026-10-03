@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install_services.sh -- registers PaperTiger's background processes as
 # systemd --user services, plus timers for the daily research retrain,
-# weekly tactical universe refresh, and periodic self-test. Linux only.
+# weekly candidate-stock re-ranking, and periodic self-test. Linux only.
 #
 # No sudo/root needed -- everything here is installed under YOUR OWN user
 # account via `systemctl --user`, so it has no more privilege than you do
@@ -64,7 +64,7 @@ install_persistent_service "papertiger-watchdog" "watchdog.py" \
     "PaperTiger: watches runtime_state.json's heartbeat; its ONLY power is creating the HALT kill file if the engine hangs. Never trades."
 
 install_persistent_service "papertiger-dashboard" "dashboard.py" \
-    "PaperTiger: status page at http://127.0.0.1:8787 with a kill-switch control and a Config tab for live risk-profile overrides. Cannot place a trade or touch the symbol whitelist."
+    "PaperTiger: status page at http://127.0.0.1:8787 with a kill-switch control, a Compare tab for the strategies, and a Config tab for live risk-profile overrides. Cannot place a trade or change which symbols any strategy trades."
 
 install_persistent_service "papertiger-engine" "run.py" \
     "PaperTiger: the live (paper by default) trading loop. Refuses to trade real money unless ALPACA_PAPER=false AND I_UNDERSTAND_THIS_IS_REAL_MONEY=yes are both set in .env."
@@ -97,14 +97,14 @@ systemctl --user daemon-reload
 systemctl --user enable --now papertiger-dailyretrain.timer
 echo "Installed papertiger-dailyretrain.timer (daily at 6:00 AM)."
 
-# -- Weekly tactical universe refresh: re-ranks the dynamic satellite pool
-#    by liquidity (see scripts/refresh_tactical_universe.py) -- purely
-#    additive on top of the static core SYMBOLS whitelist, never touches
-#    core.py's bootstrap sizing (mirrors install_services.ps1's
-#    PaperTiger-TacticalUniverseRefresh). --
+# -- Weekly candidate re-ranking: re-ranks candidate_universe.json by
+#    liquidity (see scripts/refresh_tactical_universe.py) -- the list a
+#    strategy comparison's stocks are dealt from when it starts. Never
+#    changes a running comparison's stocks or core (mirrors
+#    install_services.ps1's PaperTiger-TacticalUniverseRefresh). --
 cat > "$UNIT_DIR/papertiger-universerefresh.service" <<EOF
 [Unit]
-Description=PaperTiger: weekly re-ranking of the dynamic tactical/satellite symbol pool by liquidity.
+Description=PaperTiger: weekly re-ranking of the candidate stocks the strategy comparison is dealt from.
 
 [Service]
 Type=oneshot

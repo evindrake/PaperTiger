@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install_services.sh -- registers PaperTiger's background processes as
 # launchd LaunchAgents, plus scheduled agents for the daily research
-# retrain, weekly tactical universe refresh, and periodic self-test.
+# retrain, weekly candidate-stock re-ranking, and periodic self-test.
 # macOS only.
 #
 # No sudo needed -- everything here is installed as a per-user LaunchAgent
@@ -63,7 +63,7 @@ EOF
 install_persistent_agent "com.papertiger.watchdog" "watchdog.py" \
     "watchdog -- its ONLY power is creating the HALT kill file if the engine hangs. Never trades."
 install_persistent_agent "com.papertiger.dashboard" "dashboard.py" \
-    "status page at http://127.0.0.1:8787 with a kill-switch control and a Config tab for live risk-profile overrides. Cannot place a trade or touch the symbol whitelist."
+    "status page at http://127.0.0.1:8787 with a kill-switch control, a Compare tab for the strategies, and a Config tab for live risk-profile overrides. Cannot place a trade or change which symbols any strategy trades."
 install_persistent_agent "com.papertiger.engine" "run.py" \
     "the live (paper by default) trading loop. Refuses to trade real money unless ALPACA_PAPER=false AND I_UNDERSTAND_THIS_IS_REAL_MONEY=yes are both set in .env."
 
@@ -92,11 +92,11 @@ EOF
 load_agent "com.papertiger.dailyretrain"
 echo "Installed com.papertiger.dailyretrain (daily at 6:00 AM)."
 
-# -- Weekly tactical universe refresh: re-ranks the dynamic satellite pool
-#    by liquidity (see scripts/refresh_tactical_universe.py) -- purely
-#    additive on top of the static core SYMBOLS whitelist, never touches
-#    core.py's bootstrap sizing (mirrors install_services.ps1's
-#    PaperTiger-TacticalUniverseRefresh). --
+# -- Weekly candidate re-ranking: re-ranks candidate_universe.json by
+#    liquidity (see scripts/refresh_tactical_universe.py) -- the list a
+#    strategy comparison's stocks are dealt from when it starts. Never
+#    changes a running comparison's stocks or core (mirrors
+#    install_services.ps1's PaperTiger-TacticalUniverseRefresh). --
 cat > "$AGENT_DIR/com.papertiger.universerefresh.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

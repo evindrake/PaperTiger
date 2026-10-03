@@ -1,5 +1,5 @@
 """
-core.py -- the "core" (permanent buy-and-hold) sleeve of a core-satellite split.
+core.py -- the "core" (permanent buy-and-hold) strategy sleeve.
 
 Why this exists: backtest.py and walkforward.py have shown that the
 tactical signals (SMA crossover, RSI reversion, ML) do not reliably beat
@@ -75,7 +75,7 @@ class CoreAllocator:
 
     def is_established(self) -> bool:
         if self.cfg.core_pool_usd <= 0:
-            return True  # core-satellite disabled entirely -- nothing to establish
+            return True  # core sleeve disabled entirely (CORE_POOL_USD=0) -- nothing to establish
         holdings = self.load()
         return all(s in holdings for s in self.cfg.symbols)
 
@@ -146,7 +146,7 @@ class CoreAllocator:
             trade_log.append_trade(
                 getattr(self.cfg, "trade_log_file_path", trade_log.TRADE_LOG_FILE),
                 source="core_bootstrap", symbol=symbol, side="buy",
-                reason="one-time core-satellite allocation bootstrap",
+                reason="one-time core buy-and-hold bootstrap",
                 notional_usd=target_usd_per_symbol, limit_price=limit_price,
                 order_id=order.id, client_order_id=cid,
             )

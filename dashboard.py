@@ -24,7 +24,8 @@ _detect_tailscale_ip().
 
 CRITICAL PROPERTY: this module cannot place an order, cannot start or
 resume trading on its own, and cannot influence WHAT the engine trades
-(the symbol whitelist, the strategy, the account type) or WHETHER it
+(which symbols each strategy trades, which strategies run, the account
+type) or WHETHER it
 trades a given signal at all. The one exception, scoped narrowly on
 purpose: it can adjust HOW MUCH/HOW WIDE (position sizing and circuit-
 breaker caps) via the Config tab's risk profile, described in point 2
@@ -45,7 +46,7 @@ from broker.py/engine.py's actual order-submission code:
      write risk_profile.json (see safety.RiskProfileStore), and are
      allow-listed at the loader itself to exactly the 7 fields in
      safety.RISK_PROFILE_TUNABLE_FIELDS (position sizing and circuit-
-     breaker caps). This can NEVER touch the symbol whitelist, the account
+     breaker caps). This can NEVER touch which symbols a strategy trades, the account
      type, or the same-day round-trip check -- none of those have a
      Config field this write path is even allowed to name.
 
@@ -797,7 +798,8 @@ def _render_events_tab(state) -> str:
       <h2>Events</h2>
       <div class="hint">
         A rolling log of what the engine noticed and did, newest first -- signals evaluated, orders
-        submitted or rejected, and any errors. Useful for understanding *why* something happened, not
+        submitted or rejected, and any errors. Lines starting with [sma], [rsi] or [ml] come from that
+        strategy (the Compare tab's detail view filters them per strategy). Useful for understanding *why* something happened, not
         just *what*. Showing up to the last {EVENTS_TAB_EVENT_COUNT} (the engine itself keeps a rolling
         buffer of up to 200 in memory; the durable record of what actually happened to your money is
         always the broker, not this log).
@@ -842,7 +844,9 @@ def _render_backtest_tab(backtest) -> str:
         The chart's solid blue line going UP does NOT by itself mean the strategy is doing well -- the
         dashed gray line is what buy-and-hold did over the same period, on the same scale, so you can
         see directly whether blue is above or below dashed. Trust the Alpha number and the verdict text
-        over the shape of the line alone.
+        over the shape of the line alone. These are the nightly research results (SIGNAL_KIND on the
+        core symbols), not the live strategies -- for those, see the Compare tab, or test one strategy
+        on its own stocks with <code>python backtest.py --sleeve sma</code> (or rsi / ml).
       </div>
       {body}
     '''
@@ -886,7 +890,9 @@ def _render_walkforward_tab(walkforward) -> str:
         green line going UP is not the same claim as "this beat buy-and-hold" -- that's exactly why the
         dashed Buy&amp;Hold line is overlaid on the same scale: if the green line is below the dashed
         one, it lost, even if it's still rising. The "OOS vs Buy&amp;Hold" card and the verdict below
-        say so explicitly either way.
+        say so explicitly either way. Like the Backtest tab, this is the nightly research run
+        (SIGNAL_KIND on the core symbols); <code>python walkforward.py --sleeve sma</code> (or rsi / ml)
+        checks one live strategy on its own stocks.
       </div>
       {body}
     '''

@@ -7,7 +7,7 @@ bottom of this script) -- NSSM rotates at 5MB but never deletes the old
 copies, so without this they'd accumulate indefinitely.
 
 This is the "keep learning" half of PaperTiger's automation. run.py itself
-just executes whatever signal is currently configured in .env -- it never
+just executes whatever strategies are currently configured in .env -- it never
 experiments on its own. This script is what actually keeps searching for a
 configuration that might clear the "beats buy-and-hold AND survives
 walk-forward" bar. It runs once and exits; PaperTiger-DailyResearch (the
@@ -28,7 +28,7 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $LogFile = Join-Path $LogDir "daily_retrain.log"
 
 $Today = Get-Date -Format "yyyy-MM-dd"
-# 4 years of daily bars is plenty for this small a symbol whitelist without
+# 4 years of daily bars is plenty for this small a symbol list without
 # needing anything beyond the free IEX data feed.
 $Start = (Get-Date).AddYears(-4).ToString("yyyy-MM-dd")
 

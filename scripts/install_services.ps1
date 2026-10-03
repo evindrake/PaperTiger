@@ -12,7 +12,8 @@ easy to find in services.msc / Task Manager / Get-Service:
   - PaperTiger-Dashboard  (dashboard.py) -- status page at
     http://127.0.0.1:8787 with a kill-switch control and a Config tab for
     live risk-profile/sizing overrides. Cannot place a trade, and cannot
-    touch the symbol whitelist, account type, or round-trip check. Also
+    change which symbols any strategy trades, the account type, or the
+    round-trip check. Also
     started with --tailscale here, so it's additionally reachable at this
     machine's Tailscale IP (see `tailscale ip -4`) from other devices on
     your own tailnet -- never from the wider LAN or the public internet.
@@ -32,12 +33,14 @@ Also registers a daily Scheduled Task, PaperTiger-DailyResearch, that
 reruns backtest.py + walkforward.py + train_ml_signal.py against fresh
 data every day (see daily_retrain.ps1) -- this is the part that actually
 keeps "searching" for a better configuration; run.py itself just executes
-whatever signal is currently configured.
+whatever strategies are currently configured (once a strategy comparison
+is running, it also retrains the ML strategy's model on its own stocks).
 
 Also registers a weekly Scheduled Task, PaperTiger-TacticalUniverseRefresh,
-that re-ranks the dynamic satellite/tactical symbol pool by liquidity (see
-scripts/refresh_tactical_universe.py) -- purely additive on top of the
-static core SYMBOLS whitelist, never touches core.py's bootstrap sizing.
+that re-ranks the candidate stocks by liquidity (see
+scripts/refresh_tactical_universe.py) -- the list the signal strategies'
+stocks are dealt from when a comparison starts. It never changes the stocks
+of a comparison that's already running, and never touches core.
 
 Logs for each service go to logs\<ServiceName>.out.log / .err.log in the
 project directory, rotated at 5MB.
@@ -109,7 +112,7 @@ Install-PtService -Name "PaperTiger-Watchdog" -ScriptFile "watchdog.py" `
 
 Install-PtService -Name "PaperTiger-Dashboard" -ScriptFile "dashboard.py" -ExtraArgs "--tailscale" `
     -DisplayName "PaperTiger Dashboard" `
-    -Description "PaperTiger: status page at http://127.0.0.1:8787 with a kill-switch control and a Config tab for live risk-profile overrides. Cannot place a trade or touch the symbol whitelist. Also reachable over your tailnet -- see dashboard.py's module docstring."
+    -Description "PaperTiger: status page at http://127.0.0.1:8787 with a kill-switch control, a Compare tab for the strategies, and a Config tab for live risk-profile overrides. Cannot place a trade or change which symbols any strategy trades. Also reachable over your tailnet -- see dashboard.py's module docstring."
 
 Install-PtService -Name "PaperTiger-Engine" -ScriptFile "run.py" `
     -DisplayName "PaperTiger Engine" `
@@ -134,9 +137,10 @@ Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Se
 Write-Host ""
 Write-Host "Registered scheduled task $TaskName (daily at 6:00 AM)."
 
-# -- Weekly tactical universe refresh task -- re-ranks the dynamic
-#    satellite pool (see scripts/refresh_tactical_universe.py) from
-#    candidate_universe.json against current liquidity. Runs the Python
+# -- Weekly candidate re-ranking task -- re-ranks candidate_universe.json
+#    by current liquidity (see scripts/refresh_tactical_universe.py); the
+#    strategy comparison deals its stocks from that ranking when it starts,
+#    and a running comparison's stocks never change. Runs the Python
 #    script directly (no .ps1 wrapper needed), same pattern as the
 #    self-test task below. Weekly, not daily: this is a slow-moving
 #    liquidity ranking, not something that benefits from being refreshed
@@ -152,7 +156,7 @@ $UniversePrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType Serv
 
 Register-ScheduledTask -TaskName $UniverseTaskName -Action $UniverseAction -Trigger $UniverseTrigger `
     -Settings $UniverseSettings -Principal $UniversePrincipal `
-    -Description "PaperTiger: weekly re-ranking of the dynamic tactical/satellite symbol pool (candidate_universe.json -> tactical_universe.json) by liquidity. Purely additive on top of the static core SYMBOLS -- never touches core.py or the round-trip check." | Out-Null
+    -Description "PaperTiger: weekly re-ranking of the candidate stocks (candidate_universe.json -> tactical_universe.json) by liquidity -- the list a strategy comparison's stocks are dealt from when it starts. Never changes a running comparison's stocks, core, or the round-trip check." | Out-Null
 
 Write-Host "Registered scheduled task $UniverseTaskName (weekly, Sunday 5:00 AM)."
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # uninstall_services.sh -- removes everything install_services.sh set up:
 # the LaunchAgents for PaperTiger's watchdog, dashboard, engine, daily
-# retrain, weekly tactical universe refresh, self-test, and desktop notifier.
+# retrain, weekly candidate-stock re-ranking, self-test, and desktop notifier.
 #
 # This only removes the AGENT REGISTRATIONS -- it does not touch any
 # project files, results, or your .env. Your Alpaca account and any open

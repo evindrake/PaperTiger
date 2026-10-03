@@ -5,7 +5,7 @@
 # / ml_model.joblib for the dashboard to display.
 #
 # This is the "keep learning" half of PaperTiger's automation. run.py itself
-# just executes whatever signal is currently configured in .env -- it never
+# just executes whatever strategies are currently configured in .env -- it never
 # experiments on its own. This script is what actually keeps searching for a
 # configuration that might clear the "beats buy-and-hold AND survives
 # walk-forward" bar. It runs once and exits; the daily timer/agent installed

@@ -1,6 +1,6 @@
 """
 trade_log.py -- a small, append-only, durable record of every order this
-bot ever submitted (tactical AND core-satellite bootstrap), independent of
+bot ever submitted (every strategy sleeve's, and the core bootstrap), independent of
 the rolling in-memory event log (capped at 200 entries, reset on restart)
 and independent of whatever the broker's own order history shows.
 
@@ -41,8 +41,9 @@ def append_trade(
 ) -> None:
     """Append one JSON line describing a submitted order.
 
-    `source` is "tactical" (the signal-driven strategy) or "core_bootstrap"
-    (the one-time core-satellite allocation, see core.py).
+    `source` is the signal sleeve that placed it ("sma", "rsi" or "ml" --
+    see sleeves.py) or "core_bootstrap" (the core's one-time buy, see
+    core.py). Records from before strategy sleeves existed say "tactical".
 
     Best-effort: a logging failure here must never interrupt a trading
     decision -- any OSError is printed and swallowed, never raised.

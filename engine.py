@@ -104,12 +104,12 @@ class Engine:
         self.risk_profile_store = RiskProfileStore(cfg.risk_profile_file_path)
 
         # Recomputed fresh at the top of every _tick_inner() call (see
-        # _build_effective_cfg) by folding the live risk profile + dynamic
-        # tactical universe on top of the static self.cfg. Seeded to self.cfg
-        # here purely so it's never undefined if something reads it before
-        # the first tick completes. self.cfg itself is NEVER touched by
-        # this -- core.py's CoreAllocator stays pinned to it directly, so
-        # core bootstrap sizing can't be affected by profile/universe changes.
+        # _build_effective_cfg) by folding the live risk profile + every
+        # strategy sleeve's symbols on top of the static self.cfg. Seeded to
+        # self.cfg here purely so it's never undefined if something reads it
+        # before the first tick completes. self.cfg itself is NEVER touched
+        # by this -- core.py's CoreAllocator stays pinned to it directly, so
+        # core sizing can't be affected by profile or sleeve changes.
         self.effective_cfg = cfg
         self._current_risk_profile_name = DEFAULT_RISK_PROFILE
 
@@ -438,8 +438,8 @@ class Engine:
         self._halted = False
         self._ledgers_fresh = False
 
-        # 0. Fold the live risk profile + dynamic tactical universe on top
-        #    of the static self.cfg (see _build_effective_cfg). Done before
+        # 0. Fold the live risk profile + the strategy sleeves on top of the
+        #    static self.cfg (see _build_effective_cfg). Done before
         #    anything else so every step below -- including the kill-switch
         #    and reconcile paths' own _write_state() calls -- sees a
         #    consistent, freshly-computed self.effective_cfg.
@@ -710,11 +710,11 @@ class Engine:
     def _would_exceed_open_positions(
         self, symbol: str, open_tactical_symbols: set, approved_this_tick: set, cap: int
     ) -> bool:
-        """True if buying `symbol` would open a NEW distinct tactical
-        position beyond `cap`. Adding to a symbol that's already tactically
-        open (or already approved earlier this same tick) never counts
-        against the cap -- this bounds how many DIFFERENT symbols the
-        tactical sleeve can hold at once, not the number of buy orders."""
+        """True if buying `symbol` would open a NEW distinct position in
+        this sleeve beyond `cap`. Adding to a symbol the sleeve already holds
+        (or already approved earlier this same tick) never counts against
+        the cap -- this bounds how many DIFFERENT symbols one sleeve can hold
+        at once, not the number of buy orders."""
         if symbol in open_tactical_symbols or symbol in approved_this_tick:
             return False
         return len(open_tactical_symbols | approved_this_tick) >= cap
