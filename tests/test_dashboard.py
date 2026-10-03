@@ -452,13 +452,14 @@ class TestRenderStatusTab(unittest.TestCase):
 
     def test_config_snapshot_renders(self):
         state = {"config_snapshot": {
-            "symbols": ["SPY", "QQQ"], "signal_kind": "sma_crossover", "target_trade_usd": 25.0,
-            "max_position_usd": 60.0, "max_concentration_pct": 0.35, "daily_loss_limit_pct": 0.03,
-            "max_drawdown_pct": 0.15, "loop_interval_sec": 300.0,
+            "symbols": ["SPY", "QQQ"], "signal_kind": "sma_crossover", "trade_size_pct": 0.14,
+            "max_position_pct": 0.20, "max_concentration_pct": 0.35, "daily_loss_limit_pct": 0.03,
+            "max_drawdown_pct": 0.15, "loop_interval_sec": 300.0, "sleeve_pool_usd": 500.0,
         }}
         html = _render_status_tab(state, None)
         self.assertIn("SPY, QQQ", html)
         self.assertIn("sma_crossover", html)
+        self.assertIn("14% of each strategy's pool ($70.00 of $500)", html)
 
     def test_selftest_pass_renders(self):
         selftest = {"passed": True, "total": 100, "failures": 0, "errors": 0, "ran_at": "2026-01-01T00:00:00+00:00"}
@@ -617,7 +618,7 @@ class TestHandleRiskProfileAction(unittest.TestCase):
         self.assertEqual(state.overrides, {})
 
     def test_switching_profile_clears_prior_overrides(self):
-        RiskProfileStore(self.risk_path).write("conservative", {"target_trade_usd": 5.0})
+        RiskProfileStore(self.risk_path).write("conservative", {"trade_size_pct": 0.05})
         _handle_risk_profile_action("aggressive")
         state = RiskProfileStore(self.risk_path).load()
         self.assertEqual(state.profile, "aggressive")
@@ -640,12 +641,12 @@ class TestHandleRiskOverrideAction(unittest.TestCase):
         dashboard.RISK_PROFILE_FILE_PATH = self._orig
 
     def test_first_override_defaults_the_base_profile_to_normal(self):
-        result = _handle_risk_override_action("target_trade_usd", 33.0)
+        result = _handle_risk_override_action("trade_size_pct", 0.33)
         self.assertTrue(result["ok"])
         self.assertEqual(result["profile"], "normal")
         state = RiskProfileStore(self.risk_path).load()
         self.assertEqual(state.profile, "normal")
-        self.assertEqual(state.overrides, {"target_trade_usd": 33.0})
+        self.assertEqual(state.overrides, {"trade_size_pct": 0.33})
 
     def test_override_on_top_of_an_existing_profile_preserves_it(self):
         RiskProfileStore(self.risk_path).write("aggressive", {})
@@ -655,8 +656,8 @@ class TestHandleRiskOverrideAction(unittest.TestCase):
         self.assertEqual(state.overrides, {"max_open_positions": 4.0})
 
     def test_none_value_clears_the_override(self):
-        RiskProfileStore(self.risk_path).write("normal", {"target_trade_usd": 33.0})
-        result = _handle_risk_override_action("target_trade_usd", None)
+        RiskProfileStore(self.risk_path).write("normal", {"trade_size_pct": 0.33})
+        result = _handle_risk_override_action("trade_size_pct", None)
         self.assertTrue(result["ok"])
         state = RiskProfileStore(self.risk_path).load()
         self.assertEqual(state.overrides, {})
@@ -667,7 +668,7 @@ class TestHandleRiskOverrideAction(unittest.TestCase):
         self.assertFalse(Path(self.risk_path).exists())
 
     def test_non_numeric_value_rejected(self):
-        result = _handle_risk_override_action("target_trade_usd", "a lot")
+        result = _handle_risk_override_action("trade_size_pct", "a lot")
         self.assertFalse(result["ok"])
 
 
@@ -684,17 +685,17 @@ class TestRenderConfigTab(unittest.TestCase):
         state = {
             "config_snapshot": {
                 "symbols": ["SPY", "QQQ"],
-                "tactical_universe": ["AAPL"],
-                "signal_kind": "sma_crossover",
+                "sleeve_pool_usd": 500.0,
                 "risk_profile": {
                     "name": "aggressive",
-                    "effective": {"target_trade_usd": 40.0, "max_open_positions": 10},
+                    "effective": {"trade_size_pct": 0.14, "max_open_positions": 7},
                 },
             }
         }
         html = _render_risk_profile_controls(state)
         self.assertIn("Aggressive", html)
-        self.assertIn("$40.00", html)
+        self.assertIn("$70.00 of $500", html)
+        self.assertIn("up to about <strong>98%</strong>", html)  # 7 x 14% of each pool
 
     def test_locked_section_shows_core_and_each_sleeves_symbols(self):
         state = {"config_snapshot": {

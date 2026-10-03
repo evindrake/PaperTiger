@@ -906,8 +906,10 @@ def _render_status_tab(state, selftest) -> str:
             <tbody>
               <tr><td>Core symbols</td><td>{_escape(", ".join(cfg_snap.get("symbols", [])))}</td></tr>
               <tr><td>Strategy sleeves</td><td>{_escape(", ".join(cfg_snap.get("strategy_sleeves") or [cfg_snap.get("signal_kind") or "-"]))}</td></tr>
-              <tr><td>Trade size</td><td>${cfg_snap.get("target_trade_usd", 0):.2f}</td></tr>
-              <tr><td>Per-position cap</td><td>${cfg_snap.get("max_position_usd", 0):.2f}</td></tr>
+              <tr><td>Trade size</td><td>{_pct_of_pool(cfg_snap, cfg_snap.get("trade_size_pct"))}</td></tr>
+              <tr><td>Per-position cap</td><td>{_pct_of_pool(cfg_snap, cfg_snap.get("max_position_pct"))}</td></tr>
+              <tr><td>Cash buffer</td><td>{_pct_of_pool(cfg_snap, cfg_snap.get("cash_buffer_pct"))}</td></tr>
+              <tr><td>Max open positions (per strategy)</td><td>{cfg_snap.get("max_open_positions", "-")}</td></tr>
               <tr><td>Concentration cap</td><td>{cfg_snap.get("max_concentration_pct", 0)*100:.0f}%</td></tr>
               <tr><td>Daily loss limit</td><td>{cfg_snap.get("daily_loss_limit_pct", 0)*100:.0f}%</td></tr>
               <tr><td>Max drawdown limit</td><td>{cfg_snap.get("max_drawdown_pct", 0)*100:.0f}%</td></tr>
@@ -971,6 +973,16 @@ def _render_status_tab(state, selftest) -> str:
     '''
 
 
+def _pct_of_pool(cfg_snap, pct) -> str:
+    """e.g. "14% of each strategy's pool ($70.00 of $500)"."""
+    if not isinstance(pct, (int, float)):
+        return "-"
+    pool = cfg_snap.get("sleeve_pool_usd")
+    if isinstance(pool, (int, float)):
+        return f"{pct * 100:.0f}% of each strategy's pool (${pct * pool:,.2f} of ${pool:,.0f})"
+    return f"{pct * 100:.0f}% of each strategy's pool"
+
+
 def _render_risk_profile_controls(state) -> str:
     """The dashboard's one OTHER write path besides the kill switch (see
     module docstring) -- but narrowly scoped the same way: this can only
@@ -1007,25 +1019,26 @@ def _render_risk_profile_controls(state) -> str:
 
     rows = (
         field_row(
-            "target_trade_usd", "Trade size", f'${eff.get("target_trade_usd", 0):.2f}', "e.g. 25",
-            "Dollar size of each NEW buy a signal strategy opens (sized into fractional shares). "
-            "Bigger = fewer, larger bets; smaller = more, smaller bets from the same pool. Same for "
-            "every strategy, so the comparison stays fair.",
+            "trade_size_pct", "Trade size", _pct_of_pool(cfg_snap, eff.get("trade_size_pct")), "e.g. 0.14 = 14%",
+            "Size of each NEW buy, as a share of the strategy's own pool (sized into fractional shares). "
+            "Trade size x max open positions is roughly how much of a pool can be invested at once -- "
+            "keep that near 100% for a fair comparison against buy-and-hold, which is always fully "
+            "invested. Same for every strategy.",
         )
         + field_row(
-            "max_position_usd", "Per-position cap", f'${eff.get("max_position_usd", 0):.2f}', "e.g. 60",
-            "Hard dollar ceiling on any ONE position a signal strategy holds. A buy that would push a "
+            "max_position_pct", "Per-position cap", _pct_of_pool(cfg_snap, eff.get("max_position_pct")), "e.g. 0.20 = 20%",
+            "Hard ceiling on any ONE position, as a share of the strategy's pool. A buy that would push a "
             "position past this is rejected outright, regardless of what the signal wants.",
         )
         + field_row(
             "max_concentration_pct", "Concentration cap", f'{eff.get("max_concentration_pct", 0)*100:.0f}%', "e.g. 0.35 = 35%",
-            "Cap on any one position as a share of its strategy's own money -- guards against one "
-            "symbol dominating a strategy even if max_position_usd alone would still allow it.",
+            "Cap on any one position as a share of what its strategy is worth right now -- guards "
+            "against one symbol dominating a strategy after its other holdings have fallen.",
         )
         + field_row(
-            "cash_buffer_usd", "Cash buffer", f'${eff.get("cash_buffer_usd", 0):.2f}', "e.g. 10",
-            "Minimum cash each strategy always leaves untouched in its own pool -- a buy that would "
-            "dip below this amount is refused.",
+            "cash_buffer_pct", "Cash buffer", _pct_of_pool(cfg_snap, eff.get("cash_buffer_pct")), "e.g. 0.02 = 2%",
+            "Share of each strategy's pool always left as cash -- a buy that would dip below it is "
+            "refused.",
         )
         + field_row(
             "daily_loss_limit_pct", "Daily loss limit", f'{eff.get("daily_loss_limit_pct", 0)*100:.0f}%', "e.g. 0.03 = 3%",
@@ -1042,17 +1055,26 @@ def _render_risk_profile_controls(state) -> str:
             "max_open_positions", "Max open positions", f'{eff.get("max_open_positions", 0):g}', "e.g. 6",
             "Cap on how many DIFFERENT symbols each signal strategy can hold at once (each strategy "
             "gets this many). Adding to a symbol already open doesn't count against this -- it only "
-            "blocks opening a NEW one once the cap is hit, which is what keeps a wide symbol list "
-            "from becoming a pile of tiny buys.",
+            "blocks opening a NEW one once the cap is hit. More positions means each strategy acts on "
+            "more of its signals, which also means more trades to compare.",
         )
     )
 
+    invested = None
+    if isinstance(eff.get("trade_size_pct"), (int, float)) and isinstance(eff.get("max_open_positions"), (int, float)):
+        invested = min(1.0, eff["trade_size_pct"] * eff["max_open_positions"])
+    invested_html = (
+        f'<div class="hint">With these settings each strategy can have up to about <strong>{invested * 100:.0f}%</strong> '
+        "of its pool invested at once (trade size x max open positions); the rest waits as cash.</div>"
+        if invested is not None else ""
+    )
     return f'''
       <div class="killswitch">
         <div class="killswitch-status">Current profile: <strong>{_escape(current_profile.capitalize())}</strong></div>
         <div class="killswitch-buttons">{profile_buttons}</div>
         <div id="pt-profile-msg" class="killswitch-msg"></div>
       </div>
+      {invested_html}
       <table>
         <thead><tr><th>Field</th><th>Effective value</th><th>Manual override</th><th>What it does</th></tr></thead>
         <tbody>{rows}</tbody>
@@ -1121,7 +1143,11 @@ def _render_config_tab(state) -> str:
       <div class="hint">
         Conservative / Normal / Aggressive only ever adjust position sizing, caps, and how many distinct
         positions each strategy can have open at once -- the same values for every strategy, so the
-        comparison stays fair. Picking a profile can NEVER touch which symbols a strategy trades,
+        comparison stays fair. Sizes are a share of each strategy's own pool, so they scale with it.
+        The main difference is how much of a pool can be invested at once: about half for Conservative,
+        about 4/5 for Normal, nearly all of it for Aggressive (which also has the loosest loss limits).
+        For the strategy comparison, Aggressive is the fairest match for buy-and-hold, which is always
+        fully invested. Picking a profile can NEVER touch which symbols a strategy trades,
         the account type, or the same-day round-trip check -- that check has no configurable backing at
         all, so nothing on this page has a lever that could reach it. Selecting a profile resets any
         manual overrides below to that profile's defaults; a manual override on top of a profile persists

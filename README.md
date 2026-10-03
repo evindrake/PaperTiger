@@ -156,13 +156,31 @@ symbols.
 
 Live-adjustable from the dashboard's **Config** tab without restarting
 anything: a named preset (Conservative / Normal / Aggressive) over exactly
-7 sizing/circuit-breaker fields (trade size, per-position cap,
-concentration cap, cash buffer, daily loss limit, max drawdown, and
-`max_open_positions`), plus optional manual overrides on top. Picked from
-the dashboard, written to `risk_profile.json`, and re-read fresh by the
-engine every tick -- see `safety.RiskProfileStore`. The same values apply
-to every signal sleeve (so the comparison stays fair); `max_open_positions`
-is per sleeve. This can **never** touch which symbols a sleeve trades, the
+7 sizing/circuit-breaker fields, plus optional manual overrides on top.
+Picked from the dashboard, written to `risk_profile.json`, and re-read
+fresh by the engine every tick -- see `safety.RiskProfileStore`.
+
+Sizes are a **share of each strategy's own pool**, so a profile means the
+same thing whatever the pool is (shown here for a $500 pool):
+
+| | Conservative | Normal | Aggressive |
+|---|---|---|---|
+| Trade size | 10% ($50) | 13% ($65) | 14% ($70) |
+| Max open positions (per strategy) | 5 | 6 | 7 |
+| **Most of the pool invested at once** | **~50%** | **~78%** | **~98%** |
+| Per-position cap | 15% ($75) | 18% ($90) | 20% ($100) |
+| Concentration cap (of what the strategy is worth now) | 25% | 35% | 50% |
+| Cash buffer | 5% ($25) | 3% ($15) | 2% ($10) |
+| Daily loss limit (all strategies together) | 2% | 3% | 5% |
+| Max drawdown limit (all strategies together) | 10% | 15% | 25% |
+
+The main difference is how much of each pool can be invested at once.
+That matters for the strategy comparison: each signal is measured against
+buy-and-hold of its own stocks, which is always fully invested, so a
+strategy that can only invest half its pool trails that in a rising
+market just from holding cash. **Aggressive is the fairest setting for the
+comparison.** The same values apply to every signal sleeve, so sizing stays
+the same across strategies and only the signal differs. This can **never** touch which symbols a sleeve trades, the
 account type, or the same-day round-trip check: those have no configurable
 backing on that page at all, so there is no lever there that could reach
 them, even in principle. A missing or corrupted `risk_profile.json`

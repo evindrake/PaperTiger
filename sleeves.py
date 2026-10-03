@@ -239,6 +239,17 @@ def write_sleeves_file(
     tmp.replace(target)
 
 
+def dollar_limits(cfg, pool_usd: float) -> Dict[str, float]:
+    """The risk profile's pool-relative sizing (cfg.trade_size_pct etc.)
+    turned into the dollar fields strategy.py and safety.PreTradeCheck
+    work in, for one sleeve's pool."""
+    return {
+        "target_trade_usd": round(cfg.trade_size_pct * pool_usd, 2),
+        "max_position_usd": round(cfg.max_position_pct * pool_usd, 2),
+        "cash_buffer_usd": round(cfg.cash_buffer_pct * pool_usd, 2),
+    }
+
+
 def cfg_for_sleeve(cfg, sleeve_id: str):
     """A copy of cfg narrowed to one sleeve -- its symbols, its signal, its
     pool as starting capital, and no core carve-out -- for the offline tools

@@ -127,48 +127,58 @@ class KillSwitch:
 
 # Fields a risk profile preset or manual override is ever allowed to touch.
 # Deliberately narrow: risk-appetite dials only -- never account type, never
-# the symbol whitelist, never strategy identity, never the same-day
-# round-trip check (which has no backing Config field at all, so nothing
-# here could reach it even if it tried). core_allocation_pct is excluded on
-# purpose too: core.py treats it as a one-time bootstrap parameter tied to
-# len(cfg.symbols), not something safe to resize while the process runs.
+# which symbols a strategy trades, never strategy identity, never the
+# same-day round-trip check (which has no backing Config field at all, so
+# nothing here could reach it even if it tried). Core sizing is excluded on
+# purpose too: core is a one-time buy, not something to resize live.
+#
+# Trade size, position cap and cash buffer are FRACTIONS OF EACH STRATEGY'S
+# OWN POOL, not dollars, so a profile means the same thing whatever the pool
+# is (the engine turns them into dollars per sleeve -- see
+# sleeves.dollar_limits). The profiles differ mainly in how much of a pool
+# can be invested at once (trade size x max positions): about half for
+# Conservative, about 4/5 for Normal, nearly all of it for Aggressive. That
+# matters for the strategy comparison, since each signal is measured
+# against fully-invested buy-and-hold of its own stocks -- a strategy that
+# can only invest half its pool will trail that in a rising market just
+# from holding cash.
 RISK_PROFILE_TUNABLE_FIELDS = (
-    "target_trade_usd",
-    "max_position_usd",
+    "trade_size_pct",
+    "max_position_pct",
     "max_concentration_pct",
-    "cash_buffer_usd",
+    "cash_buffer_pct",
     "daily_loss_limit_pct",
     "max_drawdown_pct",
     "max_open_positions",
 )
 
 RISK_PROFILE_PRESETS: Dict[str, Dict[str, float]] = {
-    "conservative": {
-        "target_trade_usd": 15.0,
-        "max_position_usd": 40.0,
+    "conservative": {           # up to 5 x 10% = 50% of the pool invested
+        "trade_size_pct": 0.10,
+        "max_position_pct": 0.15,
         "max_concentration_pct": 0.25,
-        "cash_buffer_usd": 20.0,
+        "cash_buffer_pct": 0.05,
         "daily_loss_limit_pct": 0.02,
         "max_drawdown_pct": 0.10,
-        "max_open_positions": 3,
+        "max_open_positions": 5,
     },
-    "normal": {
-        "target_trade_usd": 25.0,
-        "max_position_usd": 60.0,
+    "normal": {                 # up to 6 x 13% = 78%
+        "trade_size_pct": 0.13,
+        "max_position_pct": 0.18,
         "max_concentration_pct": 0.35,
-        "cash_buffer_usd": 10.0,
+        "cash_buffer_pct": 0.03,
         "daily_loss_limit_pct": 0.03,
         "max_drawdown_pct": 0.15,
         "max_open_positions": 6,
     },
-    "aggressive": {
-        "target_trade_usd": 40.0,
-        "max_position_usd": 90.0,
+    "aggressive": {             # up to 7 x 14% = 98%
+        "trade_size_pct": 0.14,
+        "max_position_pct": 0.20,
         "max_concentration_pct": 0.50,
-        "cash_buffer_usd": 5.0,
+        "cash_buffer_pct": 0.02,
         "daily_loss_limit_pct": 0.05,
         "max_drawdown_pct": 0.25,
-        "max_open_positions": 10,
+        "max_open_positions": 7,
     },
 }
 

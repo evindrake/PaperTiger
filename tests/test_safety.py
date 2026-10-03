@@ -227,6 +227,31 @@ class TestKillSwitch(unittest.TestCase):
         self.assertIsNone(ks.reason())
 
 
+class TestRiskProfilePresets(unittest.TestCase):
+    def test_every_preset_sets_exactly_the_tunable_fields(self):
+        from safety import RISK_PROFILE_TUNABLE_FIELDS
+        for name, preset in RISK_PROFILE_PRESETS.items():
+            self.assertEqual(set(preset), set(RISK_PROFILE_TUNABLE_FIELDS), name)
+
+    def test_profiles_invest_more_of_each_pool_as_they_get_more_aggressive(self):
+        def invested(name):
+            p = RISK_PROFILE_PRESETS[name]
+            return p["trade_size_pct"] * p["max_open_positions"]
+
+        self.assertLess(invested("conservative"), invested("normal"))
+        self.assertLess(invested("normal"), invested("aggressive"))
+        # Aggressive should be close to fully invested, like the buy-and-hold
+        # benchmark each strategy is compared against -- but never over.
+        self.assertGreaterEqual(invested("aggressive"), 0.95)
+        self.assertLessEqual(invested("aggressive") + RISK_PROFILE_PRESETS["aggressive"]["cash_buffer_pct"], 1.0)
+
+    def test_normal_preset_matches_the_config_defaults(self):
+        from config import Config
+        defaults = {f.name: f.default for f in Config.__dataclass_fields__.values()}
+        for field in ("trade_size_pct", "max_position_pct", "cash_buffer_pct"):
+            self.assertEqual(RISK_PROFILE_PRESETS["normal"][field], defaults[field], field)
+
+
 class TestRiskProfileStore(unittest.TestCase):
     def setUp(self):
         import tempfile
@@ -259,12 +284,12 @@ class TestRiskProfileStore(unittest.TestCase):
 
     def test_write_then_load_round_trips_profile_and_overrides(self):
         store = RiskProfileStore(self.path)
-        store.write("aggressive", {"target_trade_usd": 33.0})
+        store.write("aggressive", {"trade_size_pct": 0.33})
         state = store.load()
         self.assertEqual(state.profile, "aggressive")
-        self.assertEqual(state.overrides, {"target_trade_usd": 33.0})
+        self.assertEqual(state.overrides, {"trade_size_pct": 0.33})
         resolved = state.resolve()
-        self.assertEqual(resolved["target_trade_usd"], 33.0)  # override wins
+        self.assertEqual(resolved["trade_size_pct"], 0.33)  # override wins
         self.assertEqual(resolved["max_open_positions"], RISK_PROFILE_PRESETS["aggressive"]["max_open_positions"])
 
     def test_write_rejects_unknown_profile(self):
@@ -275,13 +300,13 @@ class TestRiskProfileStore(unittest.TestCase):
     def test_load_drops_override_keys_outside_the_allow_list(self):
         # Simulates a hand-edited or malformed file trying to touch a
         # locked field -- this must never be allowed to reach Config.
-        payload = {"profile": "normal", "overrides": {"symbols": ["TSLA"], "alpaca_paper": False, "target_trade_usd": 12.0}}
+        payload = {"profile": "normal", "overrides": {"symbols": ["TSLA"], "alpaca_paper": False, "trade_size_pct": 0.12}}
         Path(self.path).write_text(json.dumps(payload), encoding="utf-8")
         state = RiskProfileStore(self.path).load()
-        self.assertEqual(state.overrides, {"target_trade_usd": 12.0})
+        self.assertEqual(state.overrides, {"trade_size_pct": 0.12})
 
     def test_load_drops_non_numeric_and_boolean_override_values(self):
-        payload = {"profile": "normal", "overrides": {"target_trade_usd": "a lot", "max_open_positions": True}}
+        payload = {"profile": "normal", "overrides": {"trade_size_pct": "a lot", "max_open_positions": True}}
         Path(self.path).write_text(json.dumps(payload), encoding="utf-8")
         state = RiskProfileStore(self.path).load()
         self.assertEqual(state.overrides, {})

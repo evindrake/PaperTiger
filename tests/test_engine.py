@@ -140,6 +140,10 @@ def make_cfg(tmpdir, symbols=("SPY",), **overrides):
         core_allocation_pct=0.0,
         core_pool_usd=0.0,  # core bootstrap off unless a test turns it on
         sleeve_pool_usd=500.0,
+        # Of a $500 pool: $25 trades, $60 position cap, $10 cash buffer.
+        trade_size_pct=0.05,
+        max_position_pct=0.12,
+        cash_buffer_pct=0.02,
         sleeves_file_path=str(Path(tmpdir) / "sleeves.json"),
         sleeve_history_file_path=str(Path(tmpdir) / "sleeve_history.jsonl"),
         core_holdings_file_path=str(Path(tmpdir) / "core_holdings.json"),
@@ -238,17 +242,27 @@ class TestEngineTick(unittest.TestCase):
 
     def test_sleeve_cannot_spend_beyond_its_own_pool(self):
         # The fake account has $100k of buying power, but this sleeve's pool
-        # is $40: after the $10 cash buffer it can afford one $25 buy, not two.
-        cfg = make_cfg(self.tmpdir)
-        write_sleeves(cfg, {"sma": ["AAA", "BBB"]}, pool_usd=40.0)
+        # is $100: with $40 trades and a $10 cash buffer it can afford two
+        # buys, not three.
+        cfg = make_cfg(self.tmpdir, trade_size_pct=0.4, max_position_pct=0.5, cash_buffer_pct=0.1)
+        write_sleeves(cfg, {"sma": ["AAA", "BBB", "CCC"]}, pool_usd=100.0)
         fake = FakeBroker(equity=100_000.0, cash=100_000.0, buying_power=100_000.0)
-        fake._closes["AAA"] = UPTREND
-        fake._closes["BBB"] = UPTREND
+        for sym in ("AAA", "BBB", "CCC"):
+            fake._closes[sym] = UPTREND
         engine = Engine(cfg, broker=fake)
         engine.tick()
 
-        self.assertEqual(len(fake.submitted_buys), 1)
+        self.assertEqual([b[1] for b in fake.submitted_buys], [40.0, 40.0])
         self.assertTrue(any("cash buffer" in e["message"] for e in engine._events))
+
+    def test_trade_size_scales_with_the_sleeve_pool(self):
+        cfg = make_cfg(self.tmpdir, trade_size_pct=0.14, max_position_pct=0.20)
+        write_sleeves(cfg, {"sma": ["AAA"]}, pool_usd=500.0)
+        fake = FakeBroker(equity=100_000.0, cash=100_000.0, buying_power=100_000.0)
+        fake._closes["AAA"] = UPTREND
+        Engine(cfg, broker=fake).tick()
+
+        self.assertEqual(fake.submitted_buys[0][1], 70.0)  # 14% of $500
 
     def test_open_buy_is_reserved_out_of_the_sleeve_cash(self):
         cfg = make_cfg(self.tmpdir)
@@ -516,7 +530,9 @@ class TestEngineTick(unittest.TestCase):
 
         # Raise the cap live via a risk-profile override (the dashboard's
         # own mechanism) -- a genuinely different skipped set, same day.
-        RiskProfileStore(cfg.risk_profile_file_path).write("normal", {"max_open_positions": 2})
+        RiskProfileStore(cfg.risk_profile_file_path).write(
+            "normal", {"max_open_positions": 2, "trade_size_pct": 0.05, "cash_buffer_pct": 0.02},
+        )
         engine.tick()  # cap=2 -> skips CCC, DDD only
 
         skip_events = [e for e in engine._events if "position cap" in e["message"]]

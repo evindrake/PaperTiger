@@ -69,6 +69,7 @@ from sleeves import (
     compute_core_ledger,
     compute_sleeve_ledger,
     core_topup_client_order_id,
+    dollar_limits,
     empty_sleeves,
     load_sleeves,
     reset_client_order_id,
@@ -244,8 +245,11 @@ class Engine:
                 "signal_period": self.cfg.signal_period,
                 "signal_oversold": self.cfg.signal_oversold,
                 "signal_overbought": self.cfg.signal_overbought,
-                "target_trade_usd": self.effective_cfg.target_trade_usd,
-                "max_position_usd": self.effective_cfg.max_position_usd,
+                "trade_size_pct": self.effective_cfg.trade_size_pct,
+                "max_position_pct": self.effective_cfg.max_position_pct,
+                "cash_buffer_pct": self.effective_cfg.cash_buffer_pct,
+                # The same three, in dollars, for one signal sleeve's pool.
+                "per_sleeve_dollars": dollar_limits(self.effective_cfg, self.cfg.sleeve_pool_usd),
                 "max_concentration_pct": self.effective_cfg.max_concentration_pct,
                 "daily_loss_limit_pct": self.effective_cfg.daily_loss_limit_pct,
                 "max_drawdown_pct": self.effective_cfg.max_drawdown_pct,
@@ -636,7 +640,10 @@ class Engine:
         if not spec.symbols:
             return
         label = SLEEVE_LABELS.get(spec.sleeve_id, spec.sleeve_id)
-        s_cfg = replace(self.effective_cfg, symbols=spec.symbols, signal_kind=spec.signal_kind)
+        s_cfg = replace(
+            self.effective_cfg, symbols=spec.symbols, signal_kind=spec.signal_kind,
+            **dollar_limits(self.effective_cfg, spec.pool_usd),
+        )
         if spec.signal_kind == "ml_classifier" and not Path(s_cfg.signal_model_path).exists():
             # Without this, the missing model would raise inside propose()
             # and HALT every sleeve via the consecutive-error breaker.

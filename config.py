@@ -90,10 +90,14 @@ class Config:
 
     # --- Capital & sizing ---
     seed_usd: float            # how much you actually funded the account with (informational)
+    # The three dollar fields below are what the offline tools (backtest/
+    # walkforward) size with, and cash_buffer_usd also guards the core's
+    # one-time buy. Live signal sleeves are sized from the *_pct fields
+    # further down instead, as a share of each sleeve's own pool.
     target_trade_usd: float    # dollar size of each new BUY, sized via fractional shares
     min_notional_usd: float    # reject any order intent smaller than this (avoids dust orders)
     max_position_usd: float    # hard cap on the dollar size of any single position
-    max_concentration_pct: float  # cap on (position value / account equity), e.g. 0.30 = 30%
+    max_concentration_pct: float  # cap on (position value / equity -- a sleeve's own, live), e.g. 0.30 = 30%
     cash_buffer_usd: float     # never let buying power drop below this after a BUY
 
     # --- Circuit breakers (software safety layer) ---
@@ -157,6 +161,12 @@ class Config:
     sleeve_pool_usd: float = 500.0   # budget for EACH signal sleeve
     sleeves_file_path: str = "sleeves.json"
     sleeve_history_file_path: str = "sleeve_history.jsonl"
+    # Per-sleeve sizing as fractions of each sleeve's own pool (the engine
+    # turns these into the dollar fields above, per sleeve -- see
+    # sleeves.dollar_limits). Defaults match the "normal" risk profile.
+    trade_size_pct: float = 0.13      # each new buy
+    max_position_pct: float = 0.18    # hard cap on one position
+    cash_buffer_pct: float = 0.03     # always left as cash
 
     def sleeve_kinds(self) -> Tuple[str, ...]:
         """The signal kinds that run as sleeves, in display order."""
@@ -263,6 +273,9 @@ def load_config(env_path: str | None = None) -> Config:
         sleeve_pool_usd=_get_float("SLEEVE_POOL_USD", 500.0),
         sleeves_file_path=_get_str("SLEEVES_FILE_PATH", "sleeves.json"),
         sleeve_history_file_path=_get_str("SLEEVE_HISTORY_FILE_PATH", "sleeve_history.jsonl"),
+        trade_size_pct=_get_float("TRADE_SIZE_PCT", 0.13),
+        max_position_pct=_get_float("MAX_POSITION_PCT", 0.18),
+        cash_buffer_pct=_get_float("CASH_BUFFER_PCT", 0.03),
     )
 
     from sleeves import SLEEVE_IDS  # local import: sleeves.py imports nothing from here at module level
