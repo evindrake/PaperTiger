@@ -17,7 +17,16 @@ for how sleeves share one account):
      symbol's starting price, and write sleeves.json. Core starts with
      exactly CORE_POOL_USD of value (its leftover cash is recorded), and
      every signal sleeve starts with SLEEVE_POOL_USD of cash -- so all of
-     them start equal.
+     them start equal. The settings in effect (risk profile, signal
+     parameters, breaker action) are recorded too, so the dashboard can
+     flag any change made partway through.
+  4. Research, so there's nothing else to remember: train the ML sleeve's
+     model on its own stocks (if ML is one of the sleeves), then run a
+     walk-forward test of every sleeve on its own stocks -- a historical
+     baseline for the live comparison, shown on the Compare tab. The
+     nightly research task keeps both up to date after that. A failure
+     here doesn't undo steps 1-3; it's reported, and --research-only
+     reruns just this step. (--skip-research leaves it out.)
 
 Safety:
   - Paper accounts only. It refuses to run against a live account.
@@ -34,30 +43,36 @@ Usage:
     python scripts/start_sleeve_experiment.py        # dry run
     python scripts/start_sleeve_experiment.py --execute
     python scripts/start_sleeve_experiment.py --execute --restart   # replace a running experiment
+    python scripts/start_sleeve_experiment.py --research-only       # just rerun step 4
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_DIR))
 
 from broker import Broker, BrokerError  # noqa: E402
 from config import load_config  # noqa: E402
 from core import CoreAllocator  # noqa: E402
 from refresh_tactical_universe import load_candidate_sectors  # noqa: E402
+from safety import RiskProfileStore  # noqa: E402
 from sleeves import (  # noqa: E402
     OPEN_ORDER_STATUSES,
     SLEEVE_IDS,
     SLEEVE_LABELS,
     core_topup_client_order_id,
     deal_symbols,
+    experiment_settings,
     load_sleeves,
     reset_client_order_id,
     write_sleeves_file,
@@ -134,10 +149,80 @@ def _wait_for_fills(broker: Broker, client_ids: List[str], timeout_sec: float) -
         time.sleep(10)
 
 
+def _pid_alive(pid: int) -> bool:
+    """Whether a process with this id is running. Never signals it."""
+    if sys.platform == "win32":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    import os
+
+    try:
+        os.kill(pid, 0)  # signal 0 = existence check only on POSIX
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def engine_looks_running(state_path: Path, loop_interval_sec: float) -> bool:
+    """True if the engine that last wrote runtime_state.json is still
+    running. Uses the process id it records; an older state file without
+    one falls back to "written within the last two ticks"."""
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    pid = state.get("engine_pid")
+    if isinstance(pid, int):
+        return _pid_alive(pid)
+    try:
+        written = datetime.fromisoformat(state["written_at"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (datetime.now(timezone.utc) - written).total_seconds() < loop_interval_sec * 2
+
+
+def run_research(cfg, sleeve_ids: Sequence[str]) -> bool:
+    """Step 4: train the ML sleeve's model on its own stocks, then
+    walk-forward-test every sleeve on its own stocks. Same 4-year window as
+    the nightly research task. Returns False if anything failed."""
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=4 * 365)
+    window = ["--source", "alpaca", "--start", start.isoformat(), "--end", end.isoformat()]
+    steps = []
+    if "ml" in sleeve_ids:
+        steps.append(("train the ML sleeve's model on its own stocks",
+                      ["train_ml_signal.py", *window, "--sleeve", "ml", "--model-out", cfg.signal_model_path]))
+    steps.append(("walk-forward test of every sleeve on its own stocks",
+                  ["walkforward.py", *window, "--all-sleeves"]))
+    ok = True
+    for description, cmd in steps:
+        print(f"Step 4 -- {description} (this can take a few minutes)...")
+        result = subprocess.run([sys.executable, *cmd], cwd=PROJECT_DIR)
+        if result.returncode != 0:
+            print(f"  that step failed (exit {result.returncode}) -- rerun with --research-only")
+            ok = False
+    return ok
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--execute", action="store_true", help="actually trade and write sleeves.json (default: dry run)")
     parser.add_argument("--restart", action="store_true", help="replace an experiment that's already running")
+    parser.add_argument("--skip-research", action="store_true", help="don't train/test after starting (step 4)")
+    parser.add_argument("--research-only", action="store_true",
+                        help="only rerun step 4 for the experiment that's already running")
     parser.add_argument("--fill-timeout-sec", type=float, default=600.0)
     args = parser.parse_args()
 
@@ -145,6 +230,14 @@ def main() -> int:
     if not cfg.alpaca_paper:
         print("Refusing: this resets positions and is meant for PAPER accounts only (ALPACA_PAPER=false).")
         return 2
+
+    if args.research_only:
+        running = load_sleeves(cfg)
+        if running.started_at is None:
+            print("No experiment is running yet -- nothing to research.")
+            return 2
+        return 0 if run_research(cfg, [s.sleeve_id for s in running.sleeves if s.symbols]) else 1
+
     broker = Broker(cfg)
     mode = "EXECUTE" if args.execute else "DRY RUN (nothing will change -- pass --execute to do it)"
     print(f"== start_sleeve_experiment: {mode}")
@@ -156,17 +249,11 @@ def main() -> int:
         return 2
 
     if args.execute:
-        state_path = Path(cfg.state_file_path)
-        if state_path.exists():
-            try:
-                written = datetime.fromisoformat(json.loads(state_path.read_text(encoding="utf-8"))["written_at"])
-                age = (datetime.now(timezone.utc) - written).total_seconds()
-            except (OSError, ValueError, KeyError, json.JSONDecodeError):
-                age = None
-            if age is not None and age < cfg.loop_interval_sec * 2:
-                print(f"Refusing: runtime_state.json was written {age:.0f}s ago -- the engine looks like it's "
-                      "still running. Stop it first (e.g. Stop-Service PaperTiger-Engine).")
-                return 2
+        if engine_looks_running(Path(cfg.state_file_path), cfg.loop_interval_sec):
+            print("Refusing: the engine is still running. Stop it first (Windows: Stop-Service "
+                  "PaperTiger-Engine; Linux: systemctl --user stop papertiger-engine; macOS: "
+                  "launchctl unload ~/Library/LaunchAgents/com.papertiger.engine.plist).")
+            return 2
         if not broker.market_open():
             print("Refusing: the market is closed -- the sells and top-ups need it open.")
             return 2
@@ -183,6 +270,11 @@ def main() -> int:
     sleeve_ids = [SLEEVE_IDS[k] for k in kinds]
     print(f"Sleeves: core + {', '.join(SLEEVE_LABELS[s] for s in sleeve_ids)}  "
           f"(core pool ${cfg.core_pool_usd:,.2f}, each signal sleeve ${cfg.sleeve_pool_usd:,.2f})")
+    profile_state = RiskProfileStore(cfg.risk_profile_file_path).load()
+    settings = experiment_settings(replace(cfg, **profile_state.resolve()), profile_state.profile)
+    print(f"Settings recorded at the start: risk profile {settings['risk_profile']}, trade size "
+          f"{settings['trade_size_pct']:.0%} of each pool, up to {settings['max_open_positions']} positions, "
+          f"circuit breaker action {settings['breaker_action']}")
 
     # -- symbols for each sleeve -------------------------------------------
     try:
@@ -314,10 +406,18 @@ def main() -> int:
             }
             for sid, kind in zip(sleeve_ids, kinds)
         },
+        settings=settings,
     )
-    print(f"Wrote {cfg.sleeves_file_path}: experiment started {started_at.isoformat()}. "
-          "Start the engine (e.g. Start-Service PaperTiger-Engine).")
-    return 0
+    print(f"Wrote {cfg.sleeves_file_path}: experiment started {started_at.isoformat()}, "
+          f"risk profile {settings['risk_profile']}.")
+
+    # -- step 4: research ------------------------------------------------------
+    research_ok = True
+    if not args.skip_research:
+        research_ok = run_research(cfg, sleeve_ids)
+    print("Done. Start the engine (Windows: Start-Service PaperTiger-Engine; Linux: systemctl --user start "
+          "papertiger-engine; macOS: launchctl load ~/Library/LaunchAgents/com.papertiger.engine.plist).")
+    return 0 if research_ok else 1
 
 
 if __name__ == "__main__":

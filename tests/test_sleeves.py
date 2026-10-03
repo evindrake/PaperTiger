@@ -109,6 +109,31 @@ class TestLoadSleeves(unittest.TestCase):
         self.assertEqual(loaded.all_symbols, ("JPM",))
 
 
+class TestExperimentSettings(unittest.TestCase):
+    def test_recorded_settings_round_trip_through_sleeves_json(self):
+        from sleeves import experiment_settings
+        tmpdir = tempfile.mkdtemp()
+        cfg = make_cfg(tmpdir)
+        current = SimpleNamespace(trade_size_pct=0.14, max_position_pct=0.2, max_concentration_pct=0.5,
+                                  cash_buffer_pct=0.02, daily_loss_limit_pct=0.05, max_drawdown_pct=0.25,
+                                  max_open_positions=7, breaker_action="halt", signal_fast=10, signal_slow=30,
+                                  signal_period=14, signal_oversold=30.0, signal_overbought=70.0,
+                                  signal_ml_buy_threshold=0.55, signal_ml_sell_threshold=0.45)
+        settings = experiment_settings(current, "aggressive")
+        write_sleeves_file(cfg.sleeves_file_path, started_at=T0, core_pool_usd=500.0, core_start_cash=0.0,
+                           core_symbols=cfg.symbols, sleeves={}, settings=settings)
+        self.assertEqual(load_sleeves(cfg).settings, settings)
+
+    def test_settings_changes_lists_only_what_differs(self):
+        from sleeves import settings_changes
+        at_start = {"risk_profile": "aggressive", "trade_size_pct": 0.14, "max_open_positions": 7}
+        now = {"risk_profile": "normal", "trade_size_pct": 0.13, "max_open_positions": 7}
+        self.assertEqual(
+            {c["setting"] for c in settings_changes(at_start, now)}, {"risk_profile", "trade_size_pct"},
+        )
+        self.assertEqual(settings_changes({}, now), [])  # nothing recorded -> nothing to flag
+
+
 class TestSleeveLedger(unittest.TestCase):
     def spec(self, symbols=("AAA", "BBB"), start_prices=None):
         return SleeveSpec("sma", "sma_crossover", 500.0, symbols, start_prices or {})
@@ -141,13 +166,25 @@ class TestSleeveLedger(unittest.TestCase):
         self.assertEqual(ledger.cash, 500.0)
         self.assertEqual(ledger.filled_orders, 0)
 
-    def test_other_sleeves_and_core_orders_are_ignored(self):
+    def test_orders_for_symbols_it_does_not_own_are_ignored(self):
         orders = [
-            order("pt-rsi-AAA-buy-2026-10-05", "AAA", "buy"),
+            order("pt-rsi-ZZZ-buy-2026-10-05", "ZZZ", "buy"),
             order("pt-core-SPY-buy", "SPY", "buy"),
-            order("pt-AAA-buy-2026-10-01", "AAA", "buy"),
         ]
         self.assertEqual(compute_sleeve_ledger(self.spec(), orders, {}, {}).cash, 500.0)
+
+    def test_a_flatten_sell_without_the_sleeve_tag_still_credits_the_sleeve(self):
+        # Regression: a FLATTEN's "sell everything" orders carry the broker's
+        # own ids, not pt-<sleeve>-..., and used to vanish from the ledger --
+        # the sleeve looked like it had lost everything it held.
+        orders = [
+            order("pt-sma-AAA-buy-2026-10-05", "AAA", "buy", qty=1.0, price=100.0, minutes=0),
+            order("6f1c2d-broker-generated", "AAA", "sell", qty=1.0, price=98.0, minutes=5),
+        ]
+        ledger = compute_sleeve_ledger(self.spec(), orders, {}, {})
+        self.assertAlmostEqual(ledger.cash, 498.0)
+        self.assertAlmostEqual(ledger.equity, 498.0)
+        self.assertEqual(ledger.round_trips, 1)
 
     def test_round_trips_and_win_rate(self):
         orders = [
@@ -187,6 +224,13 @@ class TestCoreLedger(unittest.TestCase):
         self.assertAlmostEqual(ledger.positions_value, 100.0)
         self.assertAlmostEqual(ledger.equity, 120.0)
         self.assertEqual(ledger.open_positions, 1)
+
+    def test_core_shares_sold_by_a_flatten_turn_into_core_cash(self):
+        # The position is gone, but the sale's proceeds are still core's.
+        orders = [order("broker-generated", "SPY", "sell", qty=1.0, price=101.0)]
+        ledger = compute_core_ledger(("SPY",), 500.0, 400.0, {}, {"SPY": 1.0}, orders)
+        self.assertAlmostEqual(ledger.positions_value, 0.0)
+        self.assertAlmostEqual(ledger.equity, 501.0)
 
     def test_without_start_cash_uses_pool_minus_cost(self):
         positions = {"SPY": position("SPY", 1.0, 100.0, avg=90.0)}

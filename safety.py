@@ -51,8 +51,10 @@ class KillMode(Enum):
     """HALT: stop opening new positions, hold what we have, keep reporting.
     FLATTEN: cancel all open orders and market-sell every position back to
     cash. FLATTEN is the stronger response -- it's what circuit breakers
-    reach for on a daily-loss or drawdown breach, since at that point the
-    priority is "stop losing money," not "preserve the current strategy."
+    reach for by default on a daily-loss or drawdown breach, since at that
+    point the priority is "stop losing money," not "preserve the current
+    strategy." (BREAKER_ACTION=halt makes them reach for HALT instead --
+    see config.py -- e.g. so a paper strategy comparison survives a bad day.)
     """
 
     HALT = "HALT"

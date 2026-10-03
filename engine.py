@@ -13,7 +13,8 @@ the entire safety story:
     2. Pull truth from the broker.           -> broker is always authoritative.
     3. Reconcile against our own records.    -> a surprise order means HALT.
     4. Rebuild every sleeve's cash and value from the broker's order history,
-       then run circuit breakers on the total. -> may escalate to FLATTEN.
+       then run circuit breakers on the total. -> may stop trading (HALT,
+       or FLATTEN to cash -- BREAKER_ACTION picks which).
     5. If the market's open, top up core (one-time) and, for EACH signal
        sleeve separately (_trade_sleeve), ask strategy to propose for that
        sleeve's own symbols only:
@@ -46,6 +47,8 @@ HALT/FLATTEN reason is still only ever cleared by a human.
 from __future__ import annotations
 
 import json
+import os
+import re
 import sys
 import time
 import traceback
@@ -71,10 +74,16 @@ from sleeves import (
     core_topup_client_order_id,
     dollar_limits,
     empty_sleeves,
+    experiment_settings,
     load_sleeves,
     reset_client_order_id,
+    settings_changes,
     sleeve_client_order_id,
 )
+
+# The kill-file reason a daily-loss / drawdown trip writes. Never auto-cleared
+# (only BROKER_CONNECTIVITY_HALT_REASON is) -- a human has to look first.
+CIRCUIT_BREAKER_REASON = "circuit breaker: daily loss or drawdown limit breached"
 from safety import (
     BROKER_CONNECTIVITY_HALT_REASON,
     DEFAULT_RISK_PROFILE,
@@ -148,6 +157,10 @@ class Engine:
         self._ledgers_fresh = False  # computed THIS tick (vs. carried over)
         self._managed_equity: Optional[float] = None  # sum of every sleeve's equity
         self._once_per_day_logged: Dict[str, date] = {}  # message key -> day last logged
+        self._risk_profile_selected: Optional[str] = None  # raw name, None if never picked
+        self._breaker_tripped = False  # a breaker stop this process triggered,
+        # not yet cleared -- once a human clears it, the breakers are re-armed
+        # from the value at that moment (see _tick_inner step 4)
 
     # -- event log / state snapshot ----------------------------------------
 
@@ -162,10 +175,21 @@ class Engine:
         )
 
     def _log_once_per_day(self, key: str, level: str, message: str) -> None:
+        """Log `message` at most once per UTC day per `key` -- for things
+        that would otherwise repeat every tick (a stop that lasts all day, an
+        order refused for the same reason every 5 minutes)."""
         today = datetime.now(timezone.utc).date()
         if self._once_per_day_logged.get(key) != today:
+            if len(self._once_per_day_logged) > 2000:  # months of unique keys -- keep only today's
+                self._once_per_day_logged = {k: d for k, d in self._once_per_day_logged.items() if d == today}
             self._once_per_day_logged[key] = today
             self._log(level, message)
+
+    def _forget_stop_logs(self) -> None:
+        """Trading is running again -- a later stop (even the same kind, the
+        same day) should be logged afresh."""
+        for key in [k for k in self._once_per_day_logged if k.startswith(("kill-", "halted-heartbeat"))]:
+            del self._once_per_day_logged[key]
 
     def _write_state(
         self,
@@ -210,6 +234,9 @@ class Engine:
             sleeves_state[sid] = entry
         state = {
             "written_at": datetime.now(timezone.utc).isoformat(),
+            # Lets scripts/start_sleeve_experiment.py tell whether the engine
+            # is still running, instead of guessing from the timestamp.
+            "engine_pid": os.getpid(),
             "halted": self._halted,
             "kill_mode": kill_mode.value if kill_mode else None,
             "account": asdict(account) if account is not None else None,
@@ -228,6 +255,12 @@ class Engine:
                 "started_at": self.sleeves.started_at.isoformat() if self.sleeves.started_at else None,
                 "frozen": self.sleeves.frozen,
                 "dropped_symbols": list(self.sleeves.dropped_symbols),
+                "settings_at_start": self.sleeves.settings,
+                # Anything that's been changed since the start -- flagged on
+                # the Compare tab, since it muddies the results after it.
+                "settings_changed": settings_changes(
+                    self.sleeves.settings, experiment_settings(self.effective_cfg, self._risk_profile_selected),
+                ),
             },
             "events": list(self._events),
             # A read-only snapshot of the operationally-relevant config, for
@@ -240,6 +273,7 @@ class Engine:
                 "core_pool_usd": self.sleeves.core_pool_usd,
                 "sleeve_pool_usd": self.cfg.sleeve_pool_usd,
                 "alpaca_paper": self.cfg.alpaca_paper,
+                "breaker_action": self.cfg.breaker_action,
                 "signal_fast": self.cfg.signal_fast,
                 "signal_slow": self.cfg.signal_slow,
                 "signal_period": self.cfg.signal_period,
@@ -366,6 +400,7 @@ class Engine:
         # when profile_state.profile is None, so effective_cfg still reflects
         # self.cfg's own .env-configured values, not this cosmetic default.
         self._current_risk_profile_name = profile_state.profile or DEFAULT_RISK_PROFILE
+        self._risk_profile_selected = profile_state.profile
         self.sleeves = load_sleeves(self.cfg)
         if self.sleeves.dropped_symbols:
             self._log_once_per_day(
@@ -492,24 +527,34 @@ class Engine:
                 account = positions = open_orders = None
                 try:
                     account = self.broker.account()
+                    orders = self.broker.orders_since(self.sleeves.started_at) if self.sleeves.started_at else []
                     positions = self.broker.positions()
                     open_orders = self.broker.open_orders()
+                    # Keep valuing the strategies while stopped, so a pause
+                    # (e.g. a circuit-breaker HALT that keeps positions)
+                    # doesn't leave a hole in the comparison history.
+                    self._update_ledgers(orders, positions, self.core.load(), quotes={})
                 except BrokerError as e:
                     self._log("error", f"kill-file active but could not fetch broker state: {e}")
 
+                # Once per day per stop (not every 5 minutes): a stop can
+                # last days, and the Live tab's status card shows it anyway.
                 if mode == KillMode.FLATTEN:
-                    self._log("warn", "kill switch in FLATTEN mode -- liquidating to cash")
+                    self._log_once_per_day(f"kill-{mode.value}-{reason}", "warn",
+                                           f"kill switch in FLATTEN mode ({reason or 'no reason given'}) -- liquidating to cash")
                     try:
                         self.broker.flatten_everything()
                     except BrokerError as e:
                         self._log("error", f"flatten_everything failed: {e}")
                 else:
-                    self._log("info", "kill switch in HALT mode -- holding, no new entries")
+                    self._log_once_per_day(f"kill-{mode.value}-{reason}", "info",
+                                           f"kill switch in HALT mode ({reason or 'no reason given'}) -- holding, no new entries")
 
                 self._write_state(account, positions, open_orders, kill_mode=mode)
                 return
             # else: fall through into the normal tick flow below (steps 2-9)
             # immediately, rather than waiting for the next scheduled tick.
+        self._forget_stop_logs()
 
         # 2. Pull truth from the broker. The broker's view always wins over
         #    any local assumption about what should be true. The order
@@ -550,28 +595,46 @@ class Engine:
         core_holdings = self.core.load()
         self._update_ledgers(orders, positions, core_holdings, quotes={})
         managed = self._managed_equity
+        if self._breaker_tripped:
+            # A human cleared the stop this process's breaker set. Without
+            # re-arming, a drawdown stop would re-trip on the very next tick
+            # (the value is still below the old peak) until prices recovered
+            # -- clearing it means "I've seen this loss, measure from here".
+            st = self.circuit_breakers.state
+            st.peak_equity = st.day_start_equity = managed
+            st.day_start_date = today
+            self._breaker_tripped = False
+            self._log("info", f"circuit breakers re-armed from the current ${managed:,.2f} after the stop was cleared")
         breaker_action = self.circuit_breakers.check_equity(managed, today)
         if breaker_action == BreakerAction.FLATTEN:
+            # The breaker's own verdict is always "stop"; BREAKER_ACTION picks
+            # whether that also sells everything (flatten) or keeps every
+            # position and just blocks new buys (halt).
+            mode = KillMode.HALT if self.cfg.breaker_action == "halt" else KillMode.FLATTEN
+            what = ("stopping new buys, keeping every position" if mode == KillMode.HALT
+                    else "liquidating everything to cash")
             self._log(
                 "warn",
-                f"circuit breaker tripped FLATTEN on strategy-managed equity ${managed:,.2f} "
+                f"circuit breaker tripped {mode.value} on strategy-managed equity ${managed:,.2f} "
                 f"(daily P/L {self.circuit_breakers.daily_pl_pct(managed):.2%}, "
-                f"drawdown {self.circuit_breakers.drawdown_pct(managed):.2%})",
+                f"drawdown {self.circuit_breakers.drawdown_pct(managed):.2%}) -- {what}",
             )
-            self.kill_switch.trigger(KillMode.FLATTEN, "circuit breaker: daily loss or drawdown limit breached")
+            self.kill_switch.trigger(mode, CIRCUIT_BREAKER_REASON)
             self._halted = True
+            self._breaker_tripped = True
             notify.send_notification(
-                self.cfg, "Engine FLATTENED: circuit breaker tripped",
+                self.cfg, f"Engine {'HALTED' if mode == KillMode.HALT else 'FLATTENED'}: circuit breaker tripped",
                 f"Strategy-managed equity ${managed:,.2f}: daily P/L "
                 f"{self.circuit_breakers.daily_pl_pct(managed):.2%}, "
-                f"drawdown {self.circuit_breakers.drawdown_pct(managed):.2%} -- "
-                f"liquidating everything to cash.",
+                f"drawdown {self.circuit_breakers.drawdown_pct(managed):.2%} -- {what}. "
+                f"Clear the kill switch on the dashboard to resume; the limits then measure from that moment.",
             )
-            try:
-                self.broker.flatten_everything()
-            except BrokerError as e:
-                self._log("error", f"flatten_everything failed: {e}")
-            self._write_state(account, positions, open_orders, kill_mode=KillMode.FLATTEN, core_holdings=core_holdings)
+            if mode == KillMode.FLATTEN:
+                try:
+                    self.broker.flatten_everything()
+                except BrokerError as e:
+                    self._log("error", f"flatten_everything failed: {e}")
+            self._write_state(account, positions, open_orders, kill_mode=mode, core_holdings=core_holdings)
             return
 
         # 5. Only look for new trades while the market is open. Log only on
@@ -621,6 +684,7 @@ class Engine:
         ledgers = {
             CORE_SLEEVE_ID: compute_core_ledger(
                 self.cfg.symbols, self.sleeves.core_pool_usd, self.sleeves.core_start_cash, positions, core_holdings,
+                orders,
             )
         }
         for spec in self.sleeves.sleeves:
@@ -680,8 +744,8 @@ class Engine:
         try:
             for intent in intents:
                 if self._is_same_day_round_trip(intent.symbol, intent.side, today, spec.sleeve_id):
-                    self._log(
-                        "info",
+                    self._log_once_per_day(
+                        f"round-trip-{spec.sleeve_id}-{intent.symbol}-{intent.side}", "info",
                         f"[{spec.sleeve_id}] skipping {intent.side} for {intent.symbol}: the opposite side "
                         f"already traded today -- refusing a same-day round trip",
                     )
@@ -693,7 +757,14 @@ class Engine:
                     continue
                 result = self.pre_trade.validate(intent, s_account, s_positions, quotes, open_orders, {})
                 if not result.ok:
-                    self._log("info", f"[{spec.sleeve_id}] rejected intent for {intent.symbol} ({intent.side}): {result.reason}")
+                    # Once per day per kind of rejection (the dollar amounts in
+                    # the reason are stripped from the key, so a cash-buffer
+                    # rejection doesn't re-log just because a price moved).
+                    reason_kind = re.sub(r"[\d$.,]+", "#", result.reason)
+                    self._log_once_per_day(
+                        f"reject-{spec.sleeve_id}-{intent.symbol}-{intent.side}-{reason_kind}", "info",
+                        f"[{spec.sleeve_id}] rejected intent for {intent.symbol} ({intent.side}): {result.reason}",
+                    )
                     continue
                 if intent.side == "buy":
                     approved_this_tick.add(intent.symbol)
@@ -765,9 +836,9 @@ class Engine:
         # than submitting blind and possibly doubling up.
         existing = self.broker.order_by_client_id(intent.client_order_id)
         if existing is not None:
-            self._log(
-                "info",
-                f"intent for {intent.symbol} ({intent.side}) already has an order "
+            self._log_once_per_day(
+                f"existing-{intent.client_order_id}", "info",
+                f"[{sleeve_id}] intent for {intent.symbol} ({intent.side}) already has an order "
                 f"({existing.id}, status={existing.status}) -- not resubmitting",
             )
             return
@@ -816,5 +887,8 @@ class Engine:
                 # itself). Every other halt reason keeps logging every tick,
                 # unchanged from before.
                 if self.kill_switch.reason() != BROKER_CONNECTIVITY_HALT_REASON:
-                    self._log("info", "engine halted -- sleeping, but not exiting (an operator must intervene)")
+                    self._log_once_per_day(
+                        "halted-heartbeat", "info",
+                        "engine halted -- still running, but not trading until an operator clears the stop",
+                    )
             time.sleep(self.cfg.loop_interval_sec)

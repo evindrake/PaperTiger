@@ -18,12 +18,17 @@ balance and one position per symbol. Two rules make that sharing safe:
      or overlapping core, is dropped from every sleeve (fail closed).
   2. VIRTUAL CASH, REBUILT FROM THE BROKER. The account has one cash
      balance, so each sleeve's cash is reconstructed every tick from the
-     broker's own order history (compute_sleeve_ledger): its pool, minus
-     what its filled buys cost, minus what its still-open buys could cost,
-     plus what its filled sells brought in. Every sleeve order carries the
-     sleeve's id in its client_order_id (pt-<sleeve>-<SYMBOL>-<side>-<date>),
-     which is how an order is attributed. Nothing is tracked in a local
-     file that could drift from what actually happened.
+     broker's own order history since the experiment started
+     (compute_sleeve_ledger): its pool, minus what its filled buys cost,
+     minus what its still-open buys could cost, plus what its filled sells
+     brought in. An order belongs to whichever sleeve owns its SYMBOL --
+     exact, because of rule 1 -- so even orders the sleeve didn't place
+     itself (a FLATTEN's "sell everything" orders) land in the right
+     ledger. Sleeve orders also carry the sleeve's id in their
+     client_order_id (pt-<sleeve>-<SYMBOL>-<side>-<date>), for the
+     same-day round-trip check and for humans reading the order history.
+     Nothing is tracked in a local file that could drift from what
+     actually happened.
 
 The engine hands each sleeve a scoped view of the account (its own cash,
 its own equity, its own symbols) and then runs the SAME strategy.propose()
@@ -114,6 +119,7 @@ class SleevesConfig:
     core_start_cash: Optional[float]
     sleeves: Tuple[SleeveSpec, ...]
     dropped_symbols: Tuple[str, ...] = ()  # removed by the disjointness check
+    settings: Dict = field(default_factory=dict)  # experiment_settings() at the start
 
     @property
     def all_symbols(self) -> Tuple[str, ...]:
@@ -210,6 +216,7 @@ def load_sleeves(cfg) -> SleevesConfig:
         core_start_cash=float(core_start_cash) if core_start_cash is not None else None,
         sleeves=tuple(parsed),
         dropped_symbols=tuple(dropped),
+        settings=raw.get("settings") if isinstance(raw.get("settings"), dict) else {},
     )
 
 
@@ -221,14 +228,17 @@ def write_sleeves_file(
     core_symbols: Sequence[str],
     sleeves: Dict[str, Dict],
     frozen: bool = True,
+    settings: Optional[Dict] = None,
 ) -> None:
     """Atomic (tmp + rename) write of sleeves.json. `sleeves` maps sleeve id
-    -> {"signal_kind", "pool_usd", "symbols", "start_prices"}."""
+    -> {"signal_kind", "pool_usd", "symbols", "start_prices"}; `settings` is
+    experiment_settings() at the start."""
     payload = {
         "_comment": "Written by scripts/start_sleeve_experiment.py. Each signal sleeve owns its "
                     "own symbols and cash pool inside the one account; see sleeves.py.",
         "started_at": started_at.isoformat(),
         "frozen": frozen,
+        "settings": settings or {},
         "core": {"pool_usd": core_pool_usd, "start_cash": round(core_start_cash, 2),
                  "symbols": list(core_symbols)},
         "sleeves": sleeves,
@@ -237,6 +247,35 @@ def write_sleeves_file(
     tmp = target.with_name(target.name + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     tmp.replace(target)
+
+
+# Every setting that changes how a sleeve behaves. Recorded in sleeves.json
+# when an experiment starts, and compared every tick against what's running
+# now -- so a mid-experiment change (say, a different risk profile in week
+# 4) is flagged on the Compare tab instead of silently muddying the results.
+EXPERIMENT_SETTING_FIELDS = (
+    "trade_size_pct", "max_position_pct", "max_concentration_pct", "cash_buffer_pct",
+    "daily_loss_limit_pct", "max_drawdown_pct", "max_open_positions", "breaker_action",
+    "signal_fast", "signal_slow", "signal_period", "signal_oversold", "signal_overbought",
+    "signal_ml_buy_threshold", "signal_ml_sell_threshold",
+)
+
+
+def experiment_settings(effective_cfg, risk_profile: Optional[str]) -> Dict:
+    """The settings in effect right now (risk profile already folded in)."""
+    settings = {f: getattr(effective_cfg, f) for f in EXPERIMENT_SETTING_FIELDS}
+    settings["risk_profile"] = risk_profile or "none (.env values)"
+    return settings
+
+
+def settings_changes(recorded: Dict, current: Dict) -> List[Dict]:
+    """[{"setting", "at_start", "now"}] for every recorded setting that
+    differs now. Empty if nothing was recorded (an older sleeves.json)."""
+    return [
+        {"setting": k, "at_start": v, "now": current.get(k)}
+        for k, v in recorded.items()
+        if k in current and current.get(k) != v
+    ]
 
 
 def dollar_limits(cfg, pool_usd: float) -> Dict[str, float]:
@@ -389,7 +428,7 @@ def compute_sleeve_ledger(
     positions: Dict[str, object],
     prices: Dict[str, float],
 ) -> SleeveLedger:
-    prefix = sleeve_order_prefix(spec.sleeve_id)
+    owned = set(spec.symbols)
     cash = spec.pool_usd
     reserved = 0.0
     filled_orders = 0
@@ -397,8 +436,11 @@ def compute_sleeve_ledger(
     wins = 0
     cycles: Dict[str, Dict[str, float]] = {}  # symbol -> open qty/cost/proceeds of the current round trip
 
+    # By symbol, not by order id: no symbol belongs to two sleeves, so this
+    # is exact -- and it also catches orders the sleeve didn't place itself,
+    # like a FLATTEN's untagged "sell everything" orders.
     ordered = sorted(
-        (o for o in orders if (o.client_order_id or "").startswith(prefix)),
+        (o for o in orders if o.symbol in owned),
         key=lambda o: o.submitted_at or datetime.min.replace(tzinfo=timezone.utc),
     )
     for o in ordered:
@@ -452,22 +494,31 @@ def compute_core_ledger(
     start_cash: Optional[float],
     positions: Dict[str, object],
     core_holdings: Dict[str, float],
+    orders: Iterable = (),
 ) -> SleeveLedger:
-    """Core never trades after its one-time buys, so its cash is the
-    constant left over at the start (or, before any experiment, its pool
-    minus what its recorded shares cost). It is its own benchmark."""
+    """Core's cash is what was left over at the start (or, before any
+    experiment, its pool minus what its recorded shares cost), adjusted by
+    any core-symbol order filled since the start -- normally none, since
+    core never trades again, but a FLATTEN sells it and the proceeds must
+    stay core's. Its value counts only the shares recorded as core that are
+    actually still held. It is its own benchmark."""
     value = 0.0
     cost = 0.0
     held = 0
     for sym in core_symbols:
         qty = core_holdings.get(sym, 0.0)
         pos = positions.get(sym)
-        if qty <= _QTY_EPSILON or pos is None:
+        if qty <= _QTY_EPSILON or pos is None or pos.qty <= _QTY_EPSILON:
             continue
         held += 1
-        value += qty * pos.current_price
-        cost += qty * pos.avg_entry_price
+        value += min(qty, pos.qty) * pos.current_price
+        cost += min(qty, pos.qty) * pos.avg_entry_price
     cash = start_cash if start_cash is not None else pool_usd - cost
+    core = set(core_symbols)
+    for o in orders:
+        if o.symbol in core and o.filled_qty:
+            filled_value = o.filled_qty * (o.filled_avg_price or 0.0)
+            cash += filled_value if o.side == "sell" else -filled_value
     return SleeveLedger(
         sleeve_id=CORE_SLEEVE_ID,
         signal_kind="buy_and_hold",

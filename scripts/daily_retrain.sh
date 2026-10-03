@@ -60,6 +60,15 @@ fi
 echo "Running ${TRAIN_ARGS[*]}..."
 "$VENV_PYTHON" "${TRAIN_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
 
+# While a strategy comparison is running, also walk-forward-test every
+# strategy on its own stocks (walkforward_results_<sleeve>.json -- the
+# Compare tab's "Historical test" column). Runs after training, so the ML
+# strategy is tested with tonight's model.
+if [ -f "$PROJECT_DIR/sleeves.json" ]; then
+    echo "Running walkforward.py --all-sleeves ($START to $TODAY)..."
+    "$VENV_PYTHON" walkforward.py --source alpaca --start "$START" --end "$TODAY" --all-sleeves 2>&1 | tee -a "$LOG_FILE"
+fi
+
 {
     echo "=== done: $(date -Is 2>/dev/null || date) ==="
 } >> "$LOG_FILE"

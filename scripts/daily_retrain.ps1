@@ -51,6 +51,16 @@ Write-Host "Running $($TrainArgs -join ' ')..."
 & $VenvPython @TrainArgs 2>&1 |
     Tee-Object -FilePath $LogFile -Append
 
+# While a strategy comparison is running, also walk-forward-test every
+# strategy on its own stocks (walkforward_results_<sleeve>.json -- the
+# Compare tab's "Historical test" column). Runs after training, so the ML
+# strategy is tested with tonight's model.
+if (Test-Path (Join-Path $ProjectDir "sleeves.json")) {
+    Write-Host "Running walkforward.py --all-sleeves ($Start to $Today)..."
+    & $VenvPython walkforward.py --source alpaca --start $Start --end $Today --all-sleeves 2>&1 |
+        Tee-Object -FilePath $LogFile -Append
+}
+
 "=== done: $(Get-Date -Format s) ===" | Add-Content -Path $LogFile
 Write-Host "Done. Full log: $LogFile"
 

@@ -102,6 +102,7 @@ WALKFORWARD_FILE = "walkforward_results.json"
 SELFTEST_FILE = "selftest_results.json"
 EQUITY_HISTORY_FILE = "equity_history.jsonl"
 SLEEVE_HISTORY_FILE = "sleeve_history.jsonl"
+SLEEVE_WALKFORWARD_FILE = "walkforward_results_{}.json"  # per sleeve id, see walkforward.py --all-sleeves
 REFRESH_SECONDS = 5
 
 # One color per strategy sleeve, used on every Compare-tab chart and table.
@@ -186,7 +187,9 @@ def _read_json(path: str):
     if not p.exists():
         return None
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        # utf-8-sig: also accepts a file saved with a byte-order mark (e.g.
+        # by Windows PowerShell 5.1's Set-Content -Encoding utf8).
+        return json.loads(p.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -653,6 +656,46 @@ def _sleeve_max_drawdowns(history) -> dict:
     return worst
 
 
+def _historical_test_cell(sid) -> str:
+    """The sleeve's walk-forward result on its own stocks (nightly, see
+    walkforward.py --all-sleeves): did its signal beat buy-and-hold of
+    those stocks on history it wasn't tuned on?"""
+    if sid == "core":
+        return "<td>-</td>"
+    result = _read_json(SLEEVE_WALKFORWARD_FILE.format(sid))
+    if not result:
+        return "<td>not run yet</td>"
+    oos = (result.get("stitched_oos_metrics") or {}).get("total_return")
+    bench = (result.get("stitched_benchmark_metrics") or {}).get("total_return")
+    if not isinstance(oos, (int, float)) or not isinstance(bench, (int, float)):
+        return "<td>-</td>"
+    beats = oos > bench
+    return (f'<td class="{"pos" if beats else "neg"}">{"beat" if beats else "lost to"} it '
+            f"({oos * 100:+.0f}% vs {bench * 100:+.0f}%)</td>")
+
+
+def _render_settings_status(experiment) -> str:
+    """What was recorded at the start, and a warning for anything changed since."""
+    at_start = experiment.get("settings_at_start") or {}
+    changed = experiment.get("settings_changed") or []
+    if changed:
+        items = "".join(
+            f"<li>{_escape(c.get('setting'))}: {_escape(c.get('at_start'))} at the start, "
+            f"{_escape(c.get('now'))} now</li>"
+            for c in changed
+        )
+        return (f'<div class="verdict neg"><strong>Settings changed since this comparison started</strong> -- '
+                f"results from before and after the change aren't directly comparable. Change them back, or "
+                f"restart the comparison to measure the new settings cleanly.<ul>{items}</ul></div>")
+    if at_start:
+        return (f'<div class="hint">Settings recorded at the start, unchanged since: risk profile '
+                f"<strong>{_escape(at_start.get('risk_profile'))}</strong>, trade size "
+                f"{(at_start.get('trade_size_pct') or 0) * 100:.0f}% of each pool, up to "
+                f"{_escape(at_start.get('max_open_positions'))} positions per strategy, circuit breaker "
+                f"action {_escape(at_start.get('breaker_action'))}.</div>")
+    return ""
+
+
 def _render_sleeve_detail(sid, sleeve, state) -> str:
     """One sleeve's symbols (with what's held now), its open orders, and its
     own recent events -- shown via the Compare tab's strategy picker."""
@@ -748,18 +791,24 @@ def _render_compare_tab(state) -> str:
             f"<td>{'%.2f%%' % (drawdowns[sid] * 100) if sid in drawdowns else '-'}</td>"
             f"<td>${s.get('cash', 0):,.2f}</td><td>{s.get('open_positions', 0)}</td>"
             f"<td>{s.get('filled_orders', 0)}</td><td>{s.get('round_trips', 0)}</td>"
-            f"<td>{'%.0f%%' % (win_rate * 100) if win_rate is not None else '-'}</td></tr>"
+            f"<td>{'%.0f%%' % (win_rate * 100) if win_rate is not None else '-'}</td>"
+            f"{_historical_test_cell(sid)}</tr>"
         )
     table = f'''
       <table>
         <thead><tr><th>Strategy</th><th>Symbols</th><th>Started with</th><th>Worth now</th><th>Return</th>
         <th>Own buy &amp; hold</th><th>vs own buy &amp; hold</th><th>Max drawdown</th><th>Cash</th>
-        <th>Holding</th><th>Filled orders</th><th>Round trips</th><th>Win rate</th></tr></thead>
+        <th>Holding</th><th>Filled orders</th><th>Round trips</th><th>Win rate</th>
+        <th>Historical test vs buy &amp; hold</th></tr></thead>
         <tbody>{rows}</tbody>
       </table>
       <div class="hint">"Own buy &amp; hold" is blank for core because core IS buy-and-hold (of the core ETFs) --
       it's the baseline every signal is ultimately trying to beat. Max drawdown is the worst fall from a
-      high point, measured once per day.</div>
+      high point, measured once per day. "Historical test" is a walk-forward test of the same signal on the
+      same stocks over the last 4 years, on stretches of history it wasn't tuned on -- run when the
+      comparison starts and again every night. It's the long-history counterpart to the live numbers:
+      if a signal lost to buy-and-hold historically and is also trailing live, that's two independent
+      hints pointing the same way.</div>
     '''
 
     pools = {sid: s.get("pool_usd") or 0 for sid, s in sleeves.items()}
@@ -781,6 +830,7 @@ def _render_compare_tab(state) -> str:
     return f'''
       {intro}
       {status}
+      {_render_settings_status(experiment)}
       {table}
       <h2>Return Since the Start</h2>
       <div class="hint">Each strategy's value as a percent gain or loss from its starting pool, one point per day.</div>
@@ -913,6 +963,7 @@ def _render_status_tab(state, selftest) -> str:
               <tr><td>Concentration cap</td><td>{cfg_snap.get("max_concentration_pct", 0)*100:.0f}%</td></tr>
               <tr><td>Daily loss limit</td><td>{cfg_snap.get("daily_loss_limit_pct", 0)*100:.0f}%</td></tr>
               <tr><td>Max drawdown limit</td><td>{cfg_snap.get("max_drawdown_pct", 0)*100:.0f}%</td></tr>
+              <tr><td>When a limit is hit</td><td>{_escape(_breaker_action_text(cfg_snap))}</td></tr>
               <tr><td>Loop interval</td><td>{cfg_snap.get("loop_interval_sec", 0):.0f}s</td></tr>
             </tbody>
           </table>
@@ -973,6 +1024,14 @@ def _render_status_tab(state, selftest) -> str:
     '''
 
 
+def _breaker_action_text(cfg_snap) -> str:
+    """What a circuit-breaker trip does under the running BREAKER_ACTION."""
+    action = cfg_snap.get("breaker_action") or _env("BREAKER_ACTION", "flatten").strip().lower()
+    if action == "halt":
+        return "HALT: no new buys, every position kept (BREAKER_ACTION=halt)"
+    return "FLATTEN: cancels open orders and sells everything to cash (BREAKER_ACTION=flatten)"
+
+
 def _pct_of_pool(cfg_snap, pct) -> str:
     """e.g. "14% of each strategy's pool ($70.00 of $500)"."""
     if not isinstance(pct, (int, float)):
@@ -1002,6 +1061,7 @@ def _render_risk_profile_controls(state) -> str:
         return f'<button class="btn {cls}" onclick="ptSetProfile(\'{name}\')">{name.capitalize()}</button>'
 
     profile_buttons = "".join(profile_button(n) for n in RISK_PROFILE_PRESETS)
+    breaker_what = _breaker_action_text(cfg_snap)
 
     def field_row(field: str, label: str, value_html: str, placeholder: str, explanation: str) -> str:
         return f'''
@@ -1043,13 +1103,14 @@ def _render_risk_profile_controls(state) -> str:
         + field_row(
             "daily_loss_limit_pct", "Daily loss limit", f'{eff.get("daily_loss_limit_pct", 0)*100:.0f}%', "e.g. 0.03 = 3%",
             "Circuit breaker: if the strategies' money (all of them together) falls this much below "
-            "where it started TODAY, the engine automatically FLATTENs (cancels open orders, sells "
-            "everything to cash).",
+            f"where it started TODAY, the engine stops trading -- {breaker_what} -- until you clear it "
+            "on the Kill Switch tab. Clearing it re-arms the limits from that moment.",
         )
         + field_row(
             "max_drawdown_pct", "Max drawdown limit", f'{eff.get("max_drawdown_pct", 0)*100:.0f}%', "e.g. 0.15 = 15%",
             "Circuit breaker: if the strategies' money falls this much below its highest point, the "
-            "engine automatically FLATTENs -- the longer-horizon sibling of the daily loss limit above.",
+            f"engine stops trading the same way ({breaker_what}) -- the longer-horizon sibling of the "
+            "daily loss limit above.",
         )
         + field_row(
             "max_open_positions", "Max open positions", f'{eff.get("max_open_positions", 0):g}', "e.g. 6",

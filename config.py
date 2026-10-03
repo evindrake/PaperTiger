@@ -167,6 +167,12 @@ class Config:
     trade_size_pct: float = 0.13      # each new buy
     max_position_pct: float = 0.18    # hard cap on one position
     cash_buffer_pct: float = 0.03     # always left as cash
+    # What a daily-loss / drawdown circuit-breaker trip does: "flatten" sells
+    # everything to cash (the safest choice with real money); "halt" stops
+    # new buys but keeps every position (so a strategy comparison's data
+    # survives one bad market day). Either way trading stays stopped until a
+    # human clears it.
+    breaker_action: str = "flatten"
 
     def sleeve_kinds(self) -> Tuple[str, ...]:
         """The signal kinds that run as sleeves, in display order."""
@@ -276,7 +282,11 @@ def load_config(env_path: str | None = None) -> Config:
         trade_size_pct=_get_float("TRADE_SIZE_PCT", 0.13),
         max_position_pct=_get_float("MAX_POSITION_PCT", 0.18),
         cash_buffer_pct=_get_float("CASH_BUFFER_PCT", 0.03),
+        breaker_action=_get_str("BREAKER_ACTION", "flatten").strip().lower(),
     )
+
+    if cfg.breaker_action not in ("flatten", "halt"):
+        raise ValueError(f"BREAKER_ACTION must be 'flatten' or 'halt', got {cfg.breaker_action!r}")
 
     from sleeves import SLEEVE_IDS  # local import: sleeves.py imports nothing from here at module level
 

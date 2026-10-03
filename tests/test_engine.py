@@ -161,7 +161,7 @@ def make_cfg(tmpdir, symbols=("SPY",), **overrides):
     return Config(**base)
 
 
-def write_sleeves(cfg, symbols_by_sleeve, pool_usd=500.0, start_prices=None):
+def write_sleeves(cfg, symbols_by_sleeve, pool_usd=500.0, start_prices=None, settings=None):
     """Write a sleeves.json giving each sleeve id ("sma"/"rsi"/"ml") its
     symbols, as scripts/start_sleeve_experiment.py would."""
     kinds = {"sma": "sma_crossover", "rsi": "rsi_reversion", "ml": "ml_classifier"}
@@ -176,6 +176,7 @@ def write_sleeves(cfg, symbols_by_sleeve, pool_usd=500.0, start_prices=None):
                   "start_prices": (start_prices or {}).get(sid, {})}
             for sid, syms in symbols_by_sleeve.items()
         },
+        settings=settings,
     )
 
 
@@ -400,6 +401,115 @@ class TestEngineTick(unittest.TestCase):
 
         self.assertTrue(fake.flattened)
         self.assertEqual(engine.kill_switch.mode(), KillMode.FLATTEN)
+
+    def _loss_setup(self, **cfg_overrides):
+        cfg = make_cfg(self.tmpdir, daily_loss_limit_pct=0.03, **cfg_overrides)
+        write_sleeves(cfg, {"sma": ["AAA"]})
+        fake = FakeBroker()
+        fake._positions["AAA"] = Position(
+            symbol="AAA", qty=4.0, market_value=400.0, avg_entry_price=100.0, current_price=100.0, side="long",
+        )
+        engine = Engine(cfg, broker=fake)
+        engine.tick()  # day starts at 900
+        fake._positions["AAA"] = Position(
+            symbol="AAA", qty=4.0, market_value=300.0, avg_entry_price=100.0, current_price=75.0, side="long",
+        )
+        engine.tick()  # 800 is down 11%
+        return cfg, fake, engine
+
+    def test_breaker_action_halt_stops_trading_but_keeps_positions(self):
+        cfg, fake, engine = self._loss_setup(breaker_action="halt")
+        self.assertFalse(fake.flattened)
+        self.assertEqual(engine.kill_switch.mode(), KillMode.HALT)
+        self.assertEqual(engine.kill_switch.reason(), "circuit breaker: daily loss or drawdown limit breached")
+
+    def test_breaker_halt_is_never_auto_cleared(self):
+        cfg, fake, engine = self._loss_setup(breaker_action="halt")
+        engine.tick()
+        engine.tick()
+        self.assertTrue(engine.kill_switch.is_triggered())
+
+    def test_clearing_a_breaker_stop_re_arms_from_the_current_value(self):
+        # Without re-arming, the still-11%-down value would re-trip the
+        # breaker on the very next tick after a human clears it.
+        cfg, fake, engine = self._loss_setup(breaker_action="halt")
+        engine.kill_switch.clear()
+        engine.tick()
+
+        self.assertFalse(engine.kill_switch.is_triggered())
+        self.assertAlmostEqual(engine.circuit_breakers.state.peak_equity, 800.0)
+        self.assertTrue(any("re-armed" in e["message"] for e in engine._events))
+
+    def test_values_are_still_recorded_while_stopped(self):
+        cfg, fake, engine = self._loss_setup(breaker_action="halt")
+        Path(cfg.sleeve_history_file_path).unlink()
+        engine.tick()  # halted tick
+        lines = Path(cfg.sleeve_history_file_path).read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(json.loads(lines[-1])["sleeves"]["sma"]["equity"], 800.0)
+
+    def test_a_stop_logs_once_per_day_not_every_tick(self):
+        cfg = make_cfg(self.tmpdir)
+        KillSwitch(cfg.kill_file_path).trigger(KillMode.HALT, "manual test halt")
+        engine = Engine(cfg, broker=FakeBroker())
+        for _ in range(4):
+            engine.tick()
+        holding = [e for e in engine._events if "holding, no new entries" in e["message"]]
+        self.assertEqual(len(holding), 1)
+        self.assertIn("manual test halt", holding[0]["message"])
+
+    def test_a_new_stop_after_resuming_is_logged_again(self):
+        cfg = make_cfg(self.tmpdir)
+        ks = KillSwitch(cfg.kill_file_path)
+        engine = Engine(cfg, broker=FakeBroker())
+        ks.trigger(KillMode.HALT, "manual test halt")
+        engine.tick()
+        ks.clear()
+        engine.tick()
+        ks.trigger(KillMode.HALT, "manual test halt")
+        engine.tick()
+        holding = [e for e in engine._events if "holding, no new entries" in e["message"]]
+        self.assertEqual(len(holding), 2)
+
+    def test_repeated_rejections_log_once_per_day(self):
+        # A buy refused for the same reason every tick (here: an open order
+        # already exists for the symbol) is logged once, not every 5 minutes.
+        cfg = make_cfg(self.tmpdir)
+        write_sleeves(cfg, {"sma": ["AAA"]})
+        fake = FakeBroker()
+        fake._closes["AAA"] = UPTREND
+        fake._open_orders = [OrderView(
+            id="x", client_order_id="pt-sma-AAA-buy-2000-01-01", symbol="AAA", side="buy", status="new",
+            qty=1.0, notional=None, filled_qty=0.0, filled_avg_price=None, limit_price=100.0, submitted_at=None,
+        )]
+        engine = Engine(cfg, broker=fake)
+        engine._known_client_order_ids = lambda extra_symbols=(): {"pt-sma-AAA-buy-2000-01-01"}
+        for _ in range(3):
+            engine.tick()
+        rejected = [e for e in engine._events if "rejected intent for AAA" in e["message"]]
+        self.assertEqual(len(rejected), 1)
+
+    def test_state_records_engine_pid(self):
+        import os
+        cfg = make_cfg(self.tmpdir)
+        Engine(cfg, broker=FakeBroker()).tick()
+        state = json.loads(Path(cfg.state_file_path).read_text(encoding="utf-8"))
+        self.assertEqual(state["engine_pid"], os.getpid())
+
+    def test_settings_changed_since_the_start_are_flagged(self):
+        from sleeves import experiment_settings
+        cfg = make_cfg(self.tmpdir)
+        write_sleeves(cfg, {"sma": ["AAA"]}, settings=experiment_settings(cfg, None))
+        engine = Engine(cfg, broker=FakeBroker())
+        engine.tick()
+        state = json.loads(Path(cfg.state_file_path).read_text(encoding="utf-8"))
+        self.assertEqual(state["experiment"]["settings_changed"], [])
+
+        RiskProfileStore(cfg.risk_profile_file_path).write("aggressive", {})
+        engine.tick()
+        state = json.loads(Path(cfg.state_file_path).read_text(encoding="utf-8"))
+        changed = {c["setting"] for c in state["experiment"]["settings_changed"]}
+        self.assertIn("risk_profile", changed)
+        self.assertIn("trade_size_pct", changed)
 
     def test_breakers_ignore_account_money_outside_the_sleeves(self):
         # A big swing in the rest of the (paper) account isn't the

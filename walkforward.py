@@ -36,7 +36,7 @@ import argparse
 import json
 import statistics
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -323,13 +323,40 @@ def main() -> None:
     parser.add_argument("--sleeve", default=None,
                         help="validate one strategy sleeve (e.g. 'rsi') on its own symbols and signal -- "
                              "see sleeves.json")
+    parser.add_argument("--all-sleeves", action="store_true",
+                        help="validate every strategy sleeve that has symbols, one after another, writing "
+                             "walkforward_results_<sleeve>.json for each (what the Compare tab shows)")
     args = parser.parse_args()
 
-    cfg = load_config()
+    base_cfg = load_config()
+    if args.all_sleeves:
+        from sleeves import cfg_for_sleeve, load_sleeves
+
+        specs = [s for s in load_sleeves(base_cfg).sleeves if s.symbols]
+        if not specs:
+            raise SystemExit("no strategy sleeve has symbols yet -- run scripts/start_sleeve_experiment.py first")
+        failed = []
+        for spec in specs:
+            out = f"walkforward_results_{spec.sleeve_id}.json"
+            print(f"\n=== {spec.sleeve_id} ({spec.signal_kind}) on {', '.join(spec.symbols)} ===")
+            try:
+                _run_and_report(cfg_for_sleeve(base_cfg, spec.sleeve_id), args, out, spec.sleeve_id)
+            except Exception as e:  # one sleeve failing (e.g. no ML model yet) shouldn't skip the rest
+                print(f"walk-forward for sleeve {spec.sleeve_id} failed: {e}")
+                failed.append(spec.sleeve_id)
+        if failed:
+            raise SystemExit(f"walk-forward failed for: {', '.join(failed)}")
+        return
+
+    cfg = base_cfg
     if args.sleeve:
         from sleeves import cfg_for_sleeve
 
         cfg = cfg_for_sleeve(cfg, args.sleeve)
+    _run_and_report(cfg, args, args.out, args.sleeve)
+
+
+def _run_and_report(cfg, args, out_path: str, sleeve_id=None) -> None:
     bt_cfg = BacktestConfig(
         initial_capital=cfg.seed_usd,
         slippage_bps=args.slippage_bps,
@@ -354,7 +381,11 @@ def main() -> None:
         train_days=args.train_days, test_days=args.test_days, step_days=args.step_days,
     )
 
-    Path(args.out).write_text(json.dumps(result, indent=2), encoding="utf-8")
+    result["generated_at"] = datetime.now(timezone.utc).isoformat()
+    result["signal_kind"] = cfg.signal_kind
+    result["symbols"] = list(cfg.symbols)
+    result["sleeve_id"] = sleeve_id
+    Path(out_path).write_text(json.dumps(result, indent=2), encoding="utf-8")
 
     print(f"Folds completed: {len(result['folds'])}")
     print(f"Avg in-sample (TRAIN) return:  {result['avg_in_sample_return']:+.2%}")
@@ -369,7 +400,7 @@ def main() -> None:
               f"(beats buy-and-hold: {result['beats_buy_and_hold']})")
     print()
     print(f"VERDICT: {result['verdict']}")
-    print(f"Results written to {args.out}")
+    print(f"Results written to {out_path}")
 
 
 if __name__ == "__main__":

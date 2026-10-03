@@ -101,6 +101,34 @@ class TestRenderCompareTab(unittest.TestCase):
         self.assertIn("submitted buy for AAPL", sma_detail)
         self.assertNotIn("something else", sma_detail)
 
+    def test_settings_changed_since_the_start_are_flagged(self):
+        state = self.state()
+        state["experiment"]["settings_changed"] = [{"setting": "risk_profile", "at_start": "aggressive", "now": "normal"}]
+        html = _render_compare_tab(state)
+        self.assertIn("Settings changed since this comparison started", html)
+        self.assertIn("risk_profile: aggressive at the start, normal now", html)
+
+    def test_unchanged_settings_show_what_was_recorded(self):
+        state = self.state()
+        state["experiment"]["settings_at_start"] = {"risk_profile": "aggressive", "trade_size_pct": 0.14,
+                                                    "max_open_positions": 7, "breaker_action": "halt"}
+        html = _render_compare_tab(state)
+        self.assertIn("risk profile <strong>aggressive</strong>", html)
+        self.assertNotIn("Settings changed", html)
+
+    def test_historical_test_column_reads_each_sleeves_walkforward_file(self):
+        original = dashboard.SLEEVE_WALKFORWARD_FILE
+        try:
+            dashboard.SLEEVE_WALKFORWARD_FILE = str(Path(self.tmpdir) / "walkforward_results_{}.json")
+            Path(dashboard.SLEEVE_WALKFORWARD_FILE.format("sma")).write_text(
+                '{"stitched_oos_metrics": {"total_return": 0.12}, '
+                '"stitched_benchmark_metrics": {"total_return": 0.30}}', encoding="utf-8")
+            html = _render_compare_tab(self.state())
+        finally:
+            dashboard.SLEEVE_WALKFORWARD_FILE = original
+        self.assertIn('<td class="neg">lost to it (+12% vs +30%)</td>', html)
+        self.assertIn("<td>not run yet</td>", html)  # rsi has no file
+
     def test_chart_draws_one_line_per_sleeve_from_history(self):
         path = dashboard.SLEEVE_HISTORY_FILE
         Path(path).write_text(

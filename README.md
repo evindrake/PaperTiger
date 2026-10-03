@@ -105,7 +105,14 @@ Which signals run is `STRATEGY_SLEEVES` in `.env` (empty = just
 - **Circuit breakers measure the strategies' money** (all sleeves
   together), not the whole account. A paper account starts with ~$100k,
   so a 3% daily-loss limit on the account would be $3,000 -- more than the
-  strategies even have -- and could never trip.
+  strategies even have -- and could never trip. What a trip does is
+  `BREAKER_ACTION`: `flatten` (the default, safest with real money) sells
+  everything to cash; `halt` stops new buys but keeps every position, so a
+  comparison survives one bad market day instead of being wiped back to
+  cash. Either way trading stays stopped until you clear it on the
+  dashboard, and clearing it re-arms the limits from that moment (otherwise
+  a drawdown stop would re-trip on the next tick until prices recovered).
+  Each strategy's value keeps being recorded while trading is stopped.
 - **Running more than one signal with real money is refused** unless you
   set `ALLOW_MULTI_STRATEGY_LIVE=yes` on top of the usual live-money flags
   (and the dashboard then shows a red warning banner on every tab). It's a
@@ -126,11 +133,16 @@ its share of `CORE_POOL_USD`; (3) deals the ranked `tactical_universe.json`
 out to the signal sleeves sector by sector (using the `sectors` map in
 `candidate_universe.json`), so each gets a similar mix -- some big tech, a
 bank, a health-care or consumer name -- and no sleeve always gets the most
-liquid name; and (4) records every symbol's starting price and writes
-`sleeves.json`. Each sleeve's symbols then **stay fixed** for the whole
-experiment; the weekly universe refresh doesn't change them (re-run with
-`--restart` to start over). It refuses to run against a live account,
-while the engine is still running, or with orders still open.
+liquid name; (4) records every symbol's starting price and the settings in
+effect (risk profile, signal parameters, breaker action) and writes
+`sleeves.json`; and (5) runs the research so nothing else needs
+remembering -- it trains the ML sleeve's model on its own stocks, then
+walk-forward-tests every sleeve on its own stocks over the last 4 years
+(`--skip-research` leaves that out; `--research-only` reruns just it).
+Each sleeve's symbols then **stay fixed** for the whole experiment; the
+weekly universe refresh doesn't change them (re-run with `--restart` to
+start over). It refuses to run against a live account, while the engine
+is still running, or with orders still open.
 
 **Reading the results** -- the dashboard's **Compare** tab shows each
 sleeve's value, return, max drawdown, trades, round trips and win rate,
@@ -141,16 +153,28 @@ sleeves trade different stocks, so their raw returns mostly show which
 stocks happened to rise; each sleeve against its own buy-and-hold takes
 that luck out. Until every signal has around 30 closed round trips, the
 tab says "too early to tell" -- and even a few months is one market mood,
-so treat the result as evidence, not proof.
+so treat the result as evidence, not proof. Slow signals (the SMA
+crossover especially) may need 3-4 months to get there.
 
-The ML sleeve needs a model trained on its own symbols:
-`python train_ml_signal.py --source alpaca --start <date> --end <date> --sleeve ml`
-(the nightly retrain does this automatically once `sleeves.json` exists,
-and the engine picks up a retrained model without a restart). Until the
-model file exists the ML sleeve just sits out, with one warning a day --
-the other sleeves keep trading. `backtest.py` and `walkforward.py` accept
-`--sleeve <sma|rsi|ml>` too, to test one sleeve's signal on its own
-symbols.
+Two more things on the Compare tab, both automatic:
+
+- **Historical test** -- each sleeve's walk-forward result on its own
+  stocks over the last 4 years, on stretches of history it wasn't tuned
+  on: did the signal beat buy-and-hold of those stocks? Run at the start
+  and again every night (`walkforward.py --all-sleeves`, writing
+  `walkforward_results_<sleeve>.json`). It's the long-history counterpart
+  to the live numbers.
+- **Settings changed since the start** -- if the risk profile, a signal
+  parameter or the breaker action is changed partway through, a warning
+  lists what changed, since results from before and after a change aren't
+  directly comparable.
+
+The ML sleeve's model is trained on its own stocks by the start script and
+then nightly, and the engine picks up a retrained model without a restart.
+If the model file is ever missing the ML sleeve just sits out, with one
+warning a day -- the other sleeves keep trading. `backtest.py` and
+`walkforward.py` accept `--sleeve <sma|rsi|ml>` too, to test one sleeve's
+signal on its own symbols by hand.
 
 ## Risk profiles
 
@@ -257,7 +281,7 @@ SIGNAL_KIND=ml_classifier python walkforward.py
 #     signal sleeves have no symbols and only the buy-and-hold core trades:
 python scripts/refresh_tactical_universe.py
 python scripts/start_sleeve_experiment.py            # dry run first
-python scripts/start_sleeve_experiment.py --execute  # market hours
+python scripts/start_sleeve_experiment.py --execute  # market hours; also trains ML + tests each sleeve
 
 # 4. Only if 2 and 3 actually hold up (beats buy-and-hold, survives OOS,
 #    stable parameters): start the watchdog, the dashboard, and the engine.
@@ -309,13 +333,13 @@ stays exactly as manual as ever.
 | `engine.py` | The live loop: fold in risk profile + sleeves -> kill check (auto-probes/resumes a broker-connectivity HALT, otherwise obeys it) -> broker truth -> reconcile -> rebuild each sleeve's cash -> breakers (on the strategies' money) -> core bootstrap -> for each signal sleeve, on its own symbols and cash: propose -> round-trip/position-cap filter -> validate -> submit -> snapshot. |
 | `watchdog.py` | Separate stdlib-only process. Its only power: creating the kill file if the engine's heartbeat goes stale. |
 | `backtest.py` | Offline simulator. Same caps as live, fills at next bar's open, buy-and-hold benchmark, core-satellite support. `--sleeve <id>` tests one sleeve's signal on its own symbols. |
-| `walkforward.py` | Train/test parameter sweep + out-of-sample verdict, signal-agnostic (grid picked from `SIGNAL_KIND`, or the sleeve's signal with `--sleeve <id>`). |
+| `walkforward.py` | Train/test parameter sweep + out-of-sample verdict, signal-agnostic (grid picked from `SIGNAL_KIND`, or the sleeve's signal with `--sleeve <id>`; `--all-sleeves` tests each sleeve on its own stocks for the Compare tab). |
 | `sweep_signal_params.py` | Quick single-pass comparison across many parameter combos -- exploration only, NOT a substitute for walk-forward. |
 | `dashboard.py` | Stdlib HTTP status page, tabbed (Live/Compare/Kill Switch/Events/Backtest/Walk-Forward/Status/Config/About), with beginner-friendly explanations and a kill-switch control (HALT/FLATTEN also send a notification and kick off a background self-test). The Compare tab shows the strategy sleeves side by side. The Config tab additionally lets you pick a risk profile and set manual per-field overrides (see `safety.RiskProfileStore`) -- still cannot place a trade or change which symbols any strategy trades. Optionally reachable from your phone over Tailscale (`--tailscale`, off by default) -- see "Remote access from your phone" below. |
 | `preflight.py` | Pre-run checks. Never places an order. |
 | `run.py` | Entrypoint: wires config -> broker -> strategy -> engine. |
 | `scripts/refresh_tactical_universe.py` | Weekly job: ranks `candidate_universe.json` by liquidity and writes the top symbols to `tactical_universe.json` -- the pool `start_sleeve_experiment.py` deals out to the signal sleeves. Doesn't change a running experiment's symbols. |
-| `scripts/start_sleeve_experiment.py` | One-time start of a strategy comparison: sells everything that isn't core, tops core up to its pool, deals symbols to the sleeves by sector, records start prices, writes `sleeves.json`. Dry run by default; paper only. |
+| `scripts/start_sleeve_experiment.py` | One-time start of a strategy comparison: sells everything that isn't core, tops core up to its pool, deals symbols to the sleeves by sector, records start prices and settings, writes `sleeves.json`, then trains the ML sleeve and walk-forward-tests every sleeve. Dry run by default; paper only. |
 | `generate_synthetic_data.py` | Writes fake OHLCV CSVs into `data/` for offline testing. |
 | `selftest.py` | Runs the full unit test suite programmatically, writes `selftest_results.json` for the dashboard's Status tab. A health check for unattended deployments, not a dev-testing replacement. |
 | `notify.py` | Optional, free-by-construction email/SMS notifications (plain SMTP + carrier email-to-SMS gateways) for HALT/FLATTEN/watchdog events. Always writes a local record for the desktop notifier (`scripts/tray_notifier.ps1` on Windows, `scripts/notifier.sh` on Linux/macOS) too. Never raises. |
@@ -330,7 +354,8 @@ services; a daily task that reruns `backtest.py` + `walkforward.py` +
 `train_ml_signal.py` against fresh data (the part that keeps searching for
 a better configuration -- `run.py` itself only ever executes whatever
 signals are currently set in `.env`; once a strategy comparison is running,
-the ML model is retrained on the ML sleeve's own symbols); a **weekly**
+the ML model is retrained on the ML sleeve's own symbols and every sleeve
+gets a fresh walk-forward test on its own stocks); a **weekly**
 task that reruns `scripts/refresh_tactical_universe.py` to re-rank the
 candidate stocks by liquidity (see "Comparing strategies side by side"
 above -- it doesn't change a running comparison); a periodic self-test (`selftest.py`, at startup/login and every 4
@@ -402,7 +427,7 @@ running OS, not the OS being off entirely.
 ## Notifications (optional, free)
 
 `notify.py` fires on engine HALT (consecutive errors, unrecognized order),
-FLATTEN (circuit breaker tripped), watchdog-triggered HALT (stale
+a circuit-breaker trip (FLATTEN, or HALT with `BREAKER_ACTION=halt`), watchdog-triggered HALT (stale
 heartbeat), auto-resume from a broker-connectivity HALT, and any
 HALT/FLATTEN/CLEAR triggered manually from the dashboard's Kill Switch tab
 -- the events you'd otherwise only discover by

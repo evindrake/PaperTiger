@@ -10,8 +10,40 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import json
+import os
+import tempfile
+from datetime import datetime, timedelta, timezone
+
 from broker import Position
-from start_sleeve_experiment import plan_core_topups, plan_reset_sells
+from start_sleeve_experiment import engine_looks_running, plan_core_topups, plan_reset_sells
+
+
+class TestEngineLooksRunning(unittest.TestCase):
+    def write_state(self, **fields):
+        path = Path(tempfile.mkdtemp()) / "runtime_state.json"
+        path.write_text(json.dumps(fields), encoding="utf-8")
+        return path
+
+    def test_live_pid_means_running(self):
+        path = self.write_state(engine_pid=os.getpid(), written_at="2000-01-01T00:00:00+00:00")
+        self.assertTrue(engine_looks_running(path, 300))
+
+    def test_dead_pid_means_stopped_even_if_just_written(self):
+        # Regression: the old check refused for 10 minutes after the engine
+        # stopped, just because the state file was still recent.
+        now = datetime.now(timezone.utc).isoformat()
+        path = self.write_state(engine_pid=2_000_000_000, written_at=now)
+        self.assertFalse(engine_looks_running(path, 300))
+
+    def test_old_state_without_pid_falls_back_to_age(self):
+        recent = datetime.now(timezone.utc).isoformat()
+        stale = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        self.assertTrue(engine_looks_running(self.write_state(written_at=recent), 300))
+        self.assertFalse(engine_looks_running(self.write_state(written_at=stale), 300))
+
+    def test_missing_file_means_stopped(self):
+        self.assertFalse(engine_looks_running(Path(tempfile.mkdtemp()) / "nope.json", 300))
 
 
 def pos(symbol, qty, price=100.0):
