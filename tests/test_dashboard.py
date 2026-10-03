@@ -21,7 +21,9 @@ from dashboard import (
     _load_env_file_values,
     _notify_cfg,
     _render_about_tab,
+    _render_compare_tab,
     _render_config_tab,
+    _render_live_multi_strategy_warning,
     _render_content,
     _render_events,
     _render_kill_switch,
@@ -32,9 +34,113 @@ from dashboard import (
     _render_positions_summary,
     _render_risk_profile_controls,
     _render_status_tab,
+    _sleeve_max_drawdowns,
     _svg_equity_curve,
+    _svg_multi_line,
 )
 from safety import KillMode, KillSwitch, RiskProfileStore
+import sleeve_history
+
+
+def _sleeve(sid, equity, round_trips=0, symbols=("AAA",), benchmark_return=None, excess=None):
+    return {
+        "sleeve_id": sid, "label": {"core": "Buy & hold (core)", "sma": "SMA crossover",
+                                    "rsi": "RSI reversion", "ml": "ML classifier"}[sid],
+        "pool_usd": 500.0, "equity": equity, "cash": 400.0, "return_pct": equity / 500.0 - 1,
+        "benchmark_return_pct": benchmark_return, "excess_return_pct": excess, "open_positions": 1,
+        "filled_orders": 2 * round_trips, "round_trips": round_trips, "win_rate": 0.5 if round_trips else None,
+        "symbols": list(symbols),
+    }
+
+
+class TestRenderCompareTab(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self._orig = dashboard.SLEEVE_HISTORY_FILE
+        dashboard.SLEEVE_HISTORY_FILE = str(Path(self.tmpdir) / "sleeve_history.jsonl")
+
+    def tearDown(self):
+        dashboard.SLEEVE_HISTORY_FILE = self._orig
+
+    def state(self, round_trips=3, started=True):
+        return {
+            "sleeves": {
+                "core": _sleeve("core", 510.0, symbols=("SPY",)),
+                "sma": _sleeve("sma", 495.0, round_trips, ("AAPL",), benchmark_return=0.02, excess=-0.03),
+                "rsi": _sleeve("rsi", 520.0, round_trips, ("JPM",), benchmark_return=0.01, excess=0.03),
+            },
+            "experiment": {"started_at": "2026-10-05T14:00:00+00:00" if started else None},
+            "positions": {"AAPL": {"qty": 0.1, "market_value": 25.0}},
+            "open_orders": [],
+            "events": [{"ts": "t", "level": "info", "message": "[sma] submitted buy for AAPL: sma_crossover buy signal"},
+                       {"ts": "t", "level": "info", "message": "[rsi] something else"}],
+        }
+
+    def test_no_state_shows_empty_message(self):
+        self.assertIn("no strategy data yet", _render_compare_tab(None))
+
+    def test_not_started_explains_how_to_start(self):
+        self.assertIn("start_sleeve_experiment.py", _render_compare_tab(self.state(started=False)))
+
+    def test_table_has_a_row_per_sleeve_with_excess_return(self):
+        html = _render_compare_tab(self.state())
+        for label in ("Buy &amp; hold (core)", "SMA crossover", "RSI reversion"):
+            self.assertIn(label, html)
+        self.assertIn('<td class="neg">-3.00%</td>', html)  # SMA trailed its own buy-and-hold
+        self.assertIn('<td class="pos">+3.00%</td>', html)  # RSI beat its own
+
+    def test_too_early_to_tell_until_enough_round_trips(self):
+        self.assertIn("Too early to tell", _render_compare_tab(self.state(round_trips=3)))
+        self.assertNotIn("Too early to tell", _render_compare_tab(self.state(round_trips=40)))
+
+    def test_detail_picker_and_per_sleeve_events(self):
+        html = _render_compare_tab(self.state())
+        self.assertIn('id="pt-sleeve-pick"', html)
+        self.assertIn('data-sleeve="sma"', html)
+        sma_detail = html.split('data-sleeve="sma"')[1].split('data-sleeve="rsi"')[0]
+        self.assertIn("submitted buy for AAPL", sma_detail)
+        self.assertNotIn("something else", sma_detail)
+
+    def test_chart_draws_one_line_per_sleeve_from_history(self):
+        path = dashboard.SLEEVE_HISTORY_FILE
+        Path(path).write_text(
+            '{"date": "2026-10-05", "sleeves": {"core": {"equity": 500}, "sma": {"equity": 500}, "rsi": {"equity": 500}}}\n'
+            '{"date": "2026-10-06", "sleeves": {"core": {"equity": 505}, "sma": {"equity": 490}, "rsi": {"equity": 510}}}\n',
+            encoding="utf-8",
+        )
+        html = _render_compare_tab(self.state())
+        self.assertEqual(html.count("<polyline"), 3)
+        self.assertIn("ptMultiHover", html)
+
+
+class TestSvgMultiLine(unittest.TestCase):
+    def test_needs_two_dates(self):
+        self.assertIn("two days of history", _svg_multi_line([("A", "#fff", {"2026-10-05": 0.0})]))
+
+    def test_one_polyline_per_series_and_hover_data(self):
+        html = _svg_multi_line([
+            ("A", "#111", {"2026-10-05": 0.0, "2026-10-06": 0.02}),
+            ("B", "#222", {"2026-10-05": 0.0, "2026-10-06": -0.01}),
+        ])
+        self.assertEqual(html.count("<polyline"), 2)
+        self.assertIn("data-multi=", html)
+        self.assertIn("stroke-dasharray", html)  # the zero line
+
+
+class TestSleeveMaxDrawdowns(unittest.TestCase):
+    def test_worst_fall_from_a_peak(self):
+        history = [{"sleeves": {"sma": {"equity": e}}} for e in (500, 550, 495, 520)]
+        self.assertAlmostEqual(_sleeve_max_drawdowns(history)["sma"], 0.10)
+
+
+class TestLiveMultiStrategyWarning(unittest.TestCase):
+    def test_shown_only_for_live_with_several_strategies(self):
+        live_multi = {"config_snapshot": {"alpaca_paper": False, "strategy_sleeves": ["sma_crossover", "rsi_reversion"]}}
+        self.assertIn("LIVE MONEY", _render_live_multi_strategy_warning(live_multi))
+        paper_multi = {"config_snapshot": {"alpaca_paper": True, "strategy_sleeves": ["sma_crossover", "rsi_reversion"]}}
+        self.assertEqual(_render_live_multi_strategy_warning(paper_multi), "")
+        live_single = {"config_snapshot": {"alpaca_paper": False, "strategy_sleeves": ["sma_crossover"]}}
+        self.assertEqual(_render_live_multi_strategy_warning(live_single), "")
 
 
 class TestDetectTailscaleIp(unittest.TestCase):
@@ -225,37 +331,29 @@ class TestRenderPositionsSummary(unittest.TestCase):
         html = _render_positions_summary({"positions": {}})
         self.assertIn("no open positions", html)
 
-    def test_zero_allocation_notes_core_satellite_disabled(self):
+    def test_each_position_is_labeled_with_its_owning_strategy(self):
         state = {
-            "core_allocation_pct": 0.0,
-            "core_holdings": {},
-            "positions": {"SPY": {"qty": 1.0, "market_value": 100.0, "current_price": 100.0, "avg_entry_price": 90.0}},
+            "core_holdings": {"SPY": 1.0},
+            "config_snapshot": {"sleeve_symbols": {"core": ["SPY"], "sma": ["AAPL"]}},
+            "positions": {
+                "SPY": {"qty": 1.0, "market_value": 100.0, "current_price": 100.0, "avg_entry_price": 90.0},
+                "AAPL": {"qty": 0.1, "market_value": 25.0, "current_price": 250.0, "avg_entry_price": 240.0},
+                "TSLA": {"qty": 0.1, "market_value": 30.0, "current_price": 300.0, "avg_entry_price": 290.0},
+            },
         }
         html = _render_positions_summary(state)
-        self.assertIn("disabled", html)
+        self.assertIn("<td>SPY</td><td>Buy &amp; hold (core)</td>", html)
+        self.assertIn("<td>AAPL</td><td>SMA crossover</td>", html)
+        self.assertIn("<td>TSLA</td><td>not owned by any strategy</td>", html)
+        self.assertIn("$155.00", html)  # total market value
 
-    def test_enabled_but_not_yet_bootstrapped_notes_pending(self):
+    def test_core_symbol_with_extra_shares_beyond_core_is_flagged(self):
         state = {
-            "core_allocation_pct": 0.5,
-            "core_holdings": {},
-            "positions": {"SPY": {"qty": 1.0, "market_value": 100.0, "current_price": 100.0, "avg_entry_price": 90.0}},
-        }
-        html = _render_positions_summary(state)
-        self.assertIn("haven't filled yet", html)
-
-    def test_core_and_tactical_split_and_totals(self):
-        # 1 share held total, 0.25 of it is core (never sold), 0.75 tactical.
-        state = {
-            "core_allocation_pct": 0.5,
             "core_holdings": {"SPY": 0.25},
+            "config_snapshot": {"sleeve_symbols": {"core": ["SPY"]}},
             "positions": {"SPY": {"qty": 1.0, "market_value": 100.0, "current_price": 100.0, "avg_entry_price": 90.0}},
         }
-        html = _render_positions_summary(state)
-        self.assertIn("SPY", html)
-        self.assertIn("$25.00", html)  # core value: 0.25 * 100.0
-        self.assertIn("$75.00", html)  # tactical value: 100.0 - 25.0
-        self.assertIn("Total", html)
-        self.assertIn("$100.00", html)  # total market value
+        self.assertIn("extra shares not owned by any strategy", _render_positions_summary(state))
 
     def test_totals_sum_across_multiple_symbols(self):
         state = {
@@ -383,15 +481,21 @@ class TestRenderAboutTab(unittest.TestCase):
     def test_mentions_core_safety_concepts(self):
         html = _render_about_tab()
         self.assertIn("CASH account", html)
-        self.assertIn("core-satellite", html.lower())
+        self.assertIn("buy-and-hold core", html)
+        self.assertIn("Compare tab", html)
         self.assertIn("Not financial advice", html)
 
 
 class TestRenderContent(unittest.TestCase):
-    def test_produces_all_eight_tab_panels(self):
+    def test_produces_all_nine_tab_panels(self):
         html = _render_content()
-        for tab in ("live", "killswitch", "events", "backtest", "walkforward", "status", "config", "about"):
+        for tab in ("live", "compare", "killswitch", "events", "backtest", "walkforward", "status", "config", "about"):
             self.assertIn(f'data-tab="{tab}"', html)
+
+    def test_page_has_a_nav_button_for_every_panel(self):
+        html = dashboard._render_page()
+        for tab in ("live", "compare", "killswitch", "events", "backtest", "walkforward", "status", "config", "about"):
+            self.assertIn(f"showTab('{tab}')", html)
 
     def test_only_live_tab_active_by_default(self):
         html = _render_content()
@@ -573,8 +677,8 @@ class TestRenderConfigTab(unittest.TestCase):
         self.assertIn("ptSetProfile('conservative')", html)
         self.assertIn("ptSetProfile('normal')", html)
         self.assertIn("ptSetProfile('aggressive')", html)
-        self.assertIn("Max open tactical positions", html)
-        self.assertIn("Tactical trade size", html)
+        self.assertIn("Max open positions", html)
+        self.assertIn("Trade size", html)
 
     def test_shows_effective_values_from_config_snapshot(self):
         state = {
@@ -592,15 +696,21 @@ class TestRenderConfigTab(unittest.TestCase):
         self.assertIn("Aggressive", html)
         self.assertIn("$40.00", html)
 
-    def test_locked_section_shows_core_and_tactical_symbols_separately(self):
-        state = {"config_snapshot": {"symbols": ["SPY", "QQQ"], "tactical_universe": ["AAPL"]}}
+    def test_locked_section_shows_core_and_each_sleeves_symbols(self):
+        state = {"config_snapshot": {
+            "symbols": ["SPY", "QQQ"],
+            "sleeve_symbols": {"core": ["SPY", "QQQ"], "sma": ["AAPL"], "rsi": ["JPM"]},
+            "core_pool_usd": 500.0, "sleeve_pool_usd": 500.0,
+        }}
         html = _render_locked_config(state)
         self.assertIn("SPY, QQQ", html)
-        self.assertIn("AAPL", html)
+        self.assertIn("SMA crossover</strong>: AAPL", html)
+        self.assertIn("RSI reversion</strong>: JPM", html)
+        self.assertIn("$500.00", html)
 
-    def test_locked_section_handles_no_tactical_universe_yet(self):
-        html = _render_locked_config({"config_snapshot": {"symbols": ["SPY"], "tactical_universe": []}})
-        self.assertIn("none yet", html)
+    def test_locked_section_handles_no_sleeve_symbols_yet(self):
+        html = _render_locked_config({"config_snapshot": {"symbols": ["SPY"], "sleeve_symbols": {"sma": []}}})
+        self.assertIn("start_sleeve_experiment.py", html)
 
 
 class TestHandleTestNotification(unittest.TestCase):

@@ -41,9 +41,9 @@ class FakeCoreBroker:
         )
 
 
-def make_cfg(tmpdir, symbols=("SPY", "QQQ"), core_allocation_pct=0.5, seed_usd=200.0):
+def make_cfg(tmpdir, symbols=("SPY", "QQQ"), core_pool_usd=100.0):
     return SimpleNamespace(
-        symbols=symbols, core_allocation_pct=core_allocation_pct, seed_usd=seed_usd,
+        symbols=symbols, core_pool_usd=core_pool_usd,
         core_holdings_file_path=str(Path(tmpdir) / "core_holdings.json"),
         quote_max_age_sec=60.0, cash_buffer_usd=10.0,
         trade_log_file_path=str(Path(tmpdir) / "trade_history.jsonl"),
@@ -65,8 +65,8 @@ class TestCoreAllocator(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
 
-    def test_disabled_when_allocation_pct_is_zero(self):
-        cfg = make_cfg(self.tmpdir, core_allocation_pct=0.0)
+    def test_disabled_when_core_pool_is_zero(self):
+        cfg = make_cfg(self.tmpdir, core_pool_usd=0.0)
         allocator = CoreAllocator(cfg)
         fake = FakeCoreBroker()
         logs = allocator.ensure_core_positions(fake, make_account(), {"SPY": make_quote("SPY")}, [])
@@ -83,7 +83,7 @@ class TestCoreAllocator(unittest.TestCase):
         self.assertEqual(len(fake.submitted), 2)
         symbols_submitted = {s[0] for s in fake.submitted}
         self.assertEqual(symbols_submitted, {"SPY", "QQQ"})
-        # $200 seed * 0.5 allocation / 2 symbols = $50 each
+        # $100 core pool / 2 symbols = $50 each
         for _, notional, _, _ in fake.submitted:
             self.assertAlmostEqual(notional, 50.0)
 
@@ -132,7 +132,7 @@ class TestCoreAllocator(unittest.TestCase):
         self.assertEqual(logs, [])  # no-op forever after
 
     def test_defers_when_insufficient_buying_power(self):
-        cfg = make_cfg(self.tmpdir, seed_usd=200.0)
+        cfg = make_cfg(self.tmpdir)
         allocator = CoreAllocator(cfg)
         fake = FakeCoreBroker()
         quotes = {"SPY": make_quote("SPY"), "QQQ": make_quote("QQQ")}

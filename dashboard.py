@@ -30,7 +30,8 @@ purpose: it can adjust HOW MUCH/HOW WIDE (position sizing and circuit-
 breaker caps) via the Config tab's risk profile, described in point 2
 below. It only reads
 runtime_state.json / backtest_results.json / walkforward_results.json /
-selftest_results.json / equity_history.jsonl off disk and renders them,
+selftest_results.json / equity_history.jsonl / sleeve_history.jsonl off
+disk and renders them,
 PLUS exactly two narrow write paths, both file-based, neither reachable
 from broker.py/engine.py's actual order-submission code:
 
@@ -83,6 +84,8 @@ from typing import List, Optional, Tuple
 
 import equity_history
 import notify
+import sleeve_history
+from sleeves import SLEEVE_LABELS
 from safety import (
     DEFAULT_RISK_PROFILE,
     RISK_PROFILE_PRESETS,
@@ -97,7 +100,15 @@ BACKTEST_FILE = "backtest_results.json"
 WALKFORWARD_FILE = "walkforward_results.json"
 SELFTEST_FILE = "selftest_results.json"
 EQUITY_HISTORY_FILE = "equity_history.jsonl"
+SLEEVE_HISTORY_FILE = "sleeve_history.jsonl"
 REFRESH_SECONDS = 5
+
+# One color per strategy sleeve, used on every Compare-tab chart and table.
+SLEEVE_COLORS = {"core": "#9ca3af", "sma": "#3b82f6", "rsi": "#f97316", "ml": "#a78bfa"}
+
+# Below this many closed round trips per signal sleeve, the Compare tab says
+# "too early to tell" -- a handful of trades can't separate skill from luck.
+MIN_ROUND_TRIPS_FOR_A_VERDICT = 30
 
 # How many events to show in each place. The engine keeps up to 200 in its
 # own rolling in-memory buffer (see engine.py's _EVENT_LOG_MAXLEN) -- these
@@ -189,6 +200,29 @@ def _escape(text) -> str:
         .replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
+    )
+
+
+def _is_paper(state) -> bool:
+    """The engine's own last-reported account type, falling back to .env."""
+    snap_paper = ((state or {}).get("config_snapshot") or {}).get("alpaca_paper")
+    if isinstance(snap_paper, bool):
+        return snap_paper
+    return _env("ALPACA_PAPER", "true").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _render_live_multi_strategy_warning(state) -> str:
+    """A banner on every tab when real money is split across several
+    strategies -- allowed only with an explicit ALLOW_MULTI_STRATEGY_LIVE
+    override (see config.guard_live), and worth never losing sight of."""
+    kinds = ((state or {}).get("config_snapshot") or {}).get("strategy_sleeves") or []
+    if _is_paper(state) or len(kinds) <= 1:
+        return ""
+    return (
+        f'<div class="live-warning">LIVE MONEY is split across {len(kinds)} strategies '
+        f'({_escape(", ".join(kinds))}). That is meant for paper trading -- with real money it divides a '
+        "small account into even smaller pools. It is only running because ALLOW_MULTI_STRATEGY_LIVE=yes "
+        "is set in .env.</div>"
     )
 
 
@@ -297,6 +331,70 @@ def _svg_equity_curve(
     '''
 
 
+def _svg_multi_line(series, width=760, height=240) -> str:
+    """Several strategies on ONE shared % axis -- the Compare tab's chart.
+
+    `series` is a list of (label, color, {date: return_pct}). Plotting
+    percent return since the start (rather than dollars) is what makes
+    sleeves directly comparable, and one shared scale keeps "this line is
+    higher" honest. Dates are the union across series; a series simply has
+    no point on a date it didn't record. A dashed zero line marks break-even.
+    Hover shows every series' value on the nearest date (ptMultiHover)."""
+    dates = sorted({d for _, _, pts in series for d in pts})
+    if len(dates) < 2:
+        return ('<div class="empty">the comparison chart starts once there are two days of history '
+                '(one point is recorded per day)</div>')
+
+    all_values = [v for _, _, pts in series for v in pts.values()] + [0.0]
+    lo, hi = min(all_values), max(all_values)
+    span = (hi - lo) or 0.01
+    pad, top_margin, bottom_margin = 10, 34, 36
+    plot_w = width - 2 * pad
+    plot_h = height - top_margin - bottom_margin
+    index = {d: i for i, d in enumerate(dates)}
+
+    def x_at(i):
+        return pad + (i / (len(dates) - 1)) * plot_w
+
+    def y_at(v):
+        return top_margin + plot_h - ((v - lo) / span) * plot_h
+
+    lines = []
+    legend = []
+    legend_x = pad
+    for label, color, pts in series:
+        coords = " ".join(f"{x_at(index[d]):.1f},{y_at(v):.1f}" for d, v in sorted(pts.items()))
+        if coords:
+            lines.append(f'<polyline fill="none" stroke="{color}" stroke-width="2" points="{coords}" />')
+        legend.append(
+            f'<rect x="{legend_x:.0f}" y="8" width="14" height="3" fill="{color}" />'
+            f'<text x="{legend_x + 18:.0f}" y="13" fill="#ccc">{_escape(label)}</text>'
+        )
+        legend_x += 18 + len(label) * 6.5 + 16
+
+    hover = json.dumps([
+        {"x": round(x_at(i), 1), "date": d,
+         "values": [[label, round(pts[d], 6)] for label, _, pts in series if d in pts]}
+        for i, d in enumerate(dates)
+    ])
+    zero_y = y_at(0.0)
+    return f'''
+    <div class="chart-wrap" data-multi='{_escape(hover)}'
+         onmousemove="ptMultiHover(event, this)" onmouseleave="ptHideChartTooltip()">
+      <svg viewBox="0 0 {width} {height}" width="100%" height="{height}" preserveAspectRatio="none" role="img"
+           aria-label="strategy comparison chart">
+        <g font-size="11">{"".join(legend)}</g>
+        <line x1="{pad}" x2="{width - pad}" y1="{zero_y:.1f}" y2="{zero_y:.1f}" stroke="#4b5563" stroke-dasharray="4,4" />
+        {"".join(lines)}
+        <text x="{pad}" y="{y_at(hi) - 3:.1f}" font-size="11" fill="#888">{hi * 100:+.1f}%</text>
+        <text x="{pad}" y="{y_at(lo) + 12:.1f}" font-size="11" fill="#888">{lo * 100:+.1f}%</text>
+        <text x="{pad}" y="{height - 2}" font-size="11" fill="#888">{_escape(dates[0])}</text>
+        <text x="{width - pad}" y="{height - 2}" font-size="11" fill="#888" text-anchor="end">{_escape(dates[-1])}</text>
+      </svg>
+    </div>
+    '''
+
+
 def _render_kill_switch() -> str:
     """Reads the kill file directly (not the cached kill_mode inside
     runtime_state.json) so this is accurate even before the engine has ever
@@ -368,13 +466,19 @@ def _render_live_performance_chart() -> str:
     return _svg_equity_curve(points, label="Positions value")
 
 
+def _symbol_owners(state) -> dict:
+    """symbol -> owning sleeve id, from the engine's config snapshot."""
+    owners = {}
+    for sid, symbols in (((state or {}).get("config_snapshot") or {}).get("sleeve_symbols") or {}).items():
+        for sym in symbols:
+            owners[sym] = sid
+    return owners
+
+
 def _render_positions_summary(state) -> str:
-    """Merged positions + core-satellite breakdown: what you hold, split
-    into the permanent core-satellite share (see core.py, never sold) and
-    the tactical share the signal actively manages, with running totals for
-    every dollar figure. Replaces what used to be two separate sections
-    (Positions, Core-Satellite Split) so the numbers reconcile in one place
-    instead of being scattered across two tables."""
+    """Everything the account holds, each labeled with the strategy sleeve
+    that owns it (see sleeves.py -- every symbol belongs to exactly one),
+    with a running total."""
     if not state:
         return '<div class="empty">no runtime_state.json yet -- start run.py to populate this section</div>'
 
@@ -382,58 +486,46 @@ def _render_positions_summary(state) -> str:
     if not positions:
         return '<div class="empty">no open positions</div>'
 
-    allocation_pct = state.get("core_allocation_pct") or 0.0
+    owners = _symbol_owners(state)
     core_holdings = state.get("core_holdings") or {}
-
     hint = (
-        'Qty is the combined total the broker actually holds for that symbol. Where core-satellite '
-        'is enabled (see the About tab), it\'s split into "Core" (bought once, never sold by this '
-        "bot -- captures the market's long-run drift regardless of signal performance) and "
-        '"Tactical" (the only share the signal actively buys/sells). Totals below are for everything '
-        "currently held, across both."
+        "Qty is what the broker actually holds. Each symbol belongs to exactly one strategy: the buy-and-hold "
+        "core (bought once, never sold) or one signal sleeve (see the Compare tab). \"Not owned by any "
+        "strategy\" means a position left over from before the strategy sleeves started -- "
+        "scripts/start_sleeve_experiment.py sells those."
     )
-    if not allocation_pct:
-        hint += " Core-satellite is currently disabled (CORE_ALLOCATION_PCT=0), so everything shown is tactical."
-    elif not core_holdings:
-        hint += f" Core-satellite is enabled ({allocation_pct:.0%} of seed capital), but the one-time bootstrap buys haven't filled yet."
 
     rows = ""
-    total_qty = total_market_value = total_core_value = total_tactical_value = 0.0
-    for symbol, p in positions.items():
+    total_value = 0.0
+    for symbol, p in sorted(positions.items(), key=lambda kv: (owners.get(kv[0], "~"), kv[0])):
         qty = p.get("qty") or 0.0
         market_value = p.get("market_value") or 0.0
         current_price = p.get("current_price")
         avg_entry = p.get("avg_entry_price")
-        core_qty = core_holdings.get(symbol, 0.0)
-        tactical_qty = max(0.0, qty - core_qty)
-        core_value = core_qty * current_price if current_price is not None else 0.0
-        tactical_value = market_value - core_value
-
-        total_qty += qty
-        total_market_value += market_value
-        total_core_value += core_value
-        total_tactical_value += tactical_value
-
+        owner = owners.get(symbol)
+        if owner is None:
+            strategy = "not owned by any strategy"
+        else:
+            strategy = SLEEVE_LABELS.get(owner, owner)
+            if owner == "core" and qty > core_holdings.get(symbol, 0.0) + 1e-6:
+                strategy += " (plus extra shares not owned by any strategy)"
+        total_value += market_value
         rows += (
-            f"<tr><td>{_escape(symbol)}</td><td>{qty:g}</td>"
-            f"<td>{core_qty:.6f}</td><td>{tactical_qty:.6f}</td>"
-            f"<td>${market_value:.2f}</td><td>${core_value:.2f}</td><td>${tactical_value:.2f}</td>"
+            f"<tr><td>{_escape(symbol)}</td><td>{_escape(strategy)}</td><td>{qty:g}</td>"
+            f"<td>${market_value:.2f}</td>"
             f"<td>{'$%.2f' % avg_entry if avg_entry is not None else '-'}</td>"
             f"<td>{'$%.2f' % current_price if current_price is not None else '-'}</td></tr>"
         )
 
     totals_row = (
-        f'<tr class="totals-row"><td><strong>Total</strong></td><td>{total_qty:g}</td><td>-</td><td>-</td>'
-        f"<td><strong>${total_market_value:.2f}</strong></td>"
-        f"<td><strong>${total_core_value:.2f}</strong></td>"
-        f"<td><strong>${total_tactical_value:.2f}</strong></td><td>-</td><td>-</td></tr>"
+        f'<tr class="totals-row"><td><strong>Total</strong></td><td>-</td><td>-</td>'
+        f"<td><strong>${total_value:.2f}</strong></td><td>-</td><td>-</td></tr>"
     )
 
     return f'''
       <div class="hint">{hint}</div>
       <table>
-        <thead><tr><th>Symbol</th><th>Qty</th><th>Core Qty</th><th>Tactical Qty</th>
-        <th>Market Value</th><th>Core Value</th><th>Tactical Value</th><th>Avg Entry</th><th>Current</th></tr></thead>
+        <thead><tr><th>Symbol</th><th>Strategy</th><th>Qty</th><th>Market Value</th><th>Avg Entry</th><th>Current</th></tr></thead>
         <tbody>{rows}{totals_row}</tbody>
       </table>
     '''
@@ -465,15 +557,17 @@ def _render_live_tab(state) -> str:
     if state:
         acct = state.get("account") or {}
         equity = acct.get("equity")
+        managed = state.get("managed_equity")
         daily_pl = state.get("daily_pl_pct")
         drawdown = state.get("drawdown_pct")
 
         status_text = f"HALTED ({live_kill_mode.value})" if halted else "RUNNING"
         live_summary = f'''
           <div class="cards">
-            <div class="card"><div class="label">Equity</div><div class="value">{"$%.2f" % equity if equity is not None else "-"}</div></div>
+            <div class="card"><div class="label">Strategies' Money</div><div class="value">{"$%.2f" % managed if managed is not None else "-"}</div></div>
             <div class="card"><div class="label">Day P/L</div><div class="value">{"%.2f%%" % (daily_pl * 100) if daily_pl is not None else "-"}</div></div>
             <div class="card"><div class="label">Drawdown</div><div class="value">{"%.2f%%" % (drawdown * 100) if drawdown is not None else "-"}</div></div>
+            <div class="card"><div class="label">Whole Account</div><div class="value">{"$%.2f" % equity if equity is not None else "-"}</div></div>
             <div class="card"><div class="label">Status</div><div class="value {"halted" if halted else "running"}">{_escape(status_text)}</div></div>
           </div>
         '''
@@ -503,19 +597,21 @@ def _render_live_tab(state) -> str:
     return f'''
       <h2>Live Engine</h2>
       <div class="hint">
-        Equity is the total account value (cash + everything you hold), marked to today's prices.
-        Day P/L is how much that's changed since the market opened today. Drawdown is how far equity
-        has fallen from its highest-ever point -- a rough measure of "how bad has it gotten" rather
-        than "how are things right now." RUNNING means the engine is trading normally; HALTED means
-        the kill switch (above) has been triggered, by you, the watchdog, or a circuit breaker.
+        Strategies' Money is what the strategy sleeves manage together -- each sleeve's cash plus what it
+        holds, marked to today's prices (the Compare tab breaks it down). Day P/L is how much that's
+        changed since the start of today, and Drawdown is how far it has fallen from its highest point
+        -- the circuit breakers act on these two numbers. Whole Account is everything in the Alpaca
+        account, including money no strategy uses (a paper account starts with far more than the
+        strategies are given). RUNNING means the engine is trading normally; HALTED means the kill
+        switch has been triggered, by you, the watchdog, or a circuit breaker.
       </div>
       {live_summary}
 
       <h2>Live Performance (Last 30 Days)</h2>
       <div class="hint">
         Total market value of everything currently held (excludes idle cash, unlike Equity above) --
-        one point per day. This is about what you HOLD, not how the tactical signal itself is doing;
-        it moves with market prices regardless of whether the signal ever trades. There's no history
+        one point per day. This is about what you HOLD, not how any one strategy is doing (see the
+        Compare tab for that); it moves with market prices regardless of whether a signal ever trades. There's no history
         from before this feature existed, so days before today show $0 as a placeholder rather than
         being left blank -- real values fill in day by day from here on.
       </div>
@@ -530,6 +626,167 @@ def _render_live_tab(state) -> str:
 
       <h2>Recent Events <span class="tab-link" onclick="showTab('events')">(see all &rarr;)</span></h2>
       {events_html}
+    '''
+
+
+def _pct_cell(value) -> str:
+    """A signed percent, green when positive and red when negative."""
+    if value is None:
+        return "<td>-</td>"
+    css = "pos" if value > 0 else "neg" if value < 0 else ""
+    return f'<td class="{css}">{value * 100:+.2f}%</td>'
+
+
+def _sleeve_max_drawdowns(history) -> dict:
+    """Worst peak-to-trough fall per sleeve over its daily history."""
+    peaks: dict = {}
+    worst: dict = {}
+    for entry in history:
+        for sid, snap in (entry.get("sleeves") or {}).items():
+            equity = snap.get("equity")
+            if not isinstance(equity, (int, float)):
+                continue
+            peaks[sid] = max(peaks.get(sid, equity), equity)
+            if peaks[sid] > 0:
+                worst[sid] = max(worst.get(sid, 0.0), (peaks[sid] - equity) / peaks[sid])
+    return worst
+
+
+def _render_sleeve_detail(sid, sleeve, state) -> str:
+    """One sleeve's symbols (with what's held now), its open orders, and its
+    own recent events -- shown via the Compare tab's strategy picker."""
+    positions = state.get("positions") or {}
+    symbols = sleeve.get("symbols") or []
+    symbol_rows = "".join(
+        f"<tr><td>{_escape(sym)}</td>"
+        + (f"<td>{positions[sym].get('qty', 0):g}</td><td>${positions[sym].get('market_value', 0):.2f}</td>"
+           if sym in positions else "<td>-</td><td>not held</td>")
+        + "</tr>"
+        for sym in symbols
+    ) or '<tr><td colspan="3">no symbols</td></tr>'
+    orders = [o for o in (state.get("open_orders") or []) if o.get("symbol") in symbols]
+    order_rows = "".join(
+        f"<tr><td>{_escape(o.get('symbol'))}</td><td>{_escape(o.get('side'))}</td>"
+        f"<td>{_escape(o.get('status'))}</td><td>{o.get('limit_price')}</td></tr>"
+        for o in orders
+    )
+    orders_html = (
+        f"<table><thead><tr><th>Symbol</th><th>Side</th><th>Status</th><th>Limit</th></tr></thead>"
+        f"<tbody>{order_rows}</tbody></table>" if order_rows else '<div class="empty">no open orders</div>'
+    )
+    own_events = [e for e in (state.get("events") or []) if str(e.get("message", "")).startswith(f"[{sid}]")]
+    events_html = _render_events(own_events, 15, "no recent events for this strategy")
+    hidden = "" if sid == "core" else ' style="display:none"'
+    return f'''
+      <div class="sleeve-detail" data-sleeve="{_escape(sid)}"{hidden}>
+        <table><thead><tr><th>Symbol</th><th>Qty held</th><th>Value</th></tr></thead><tbody>{symbol_rows}</tbody></table>
+        <h2>Open orders</h2>{orders_html}
+        <h2>Recent events</h2>{events_html}
+      </div>
+    '''
+
+
+def _render_compare_tab(state) -> str:
+    """Side-by-side results of the strategy sleeves (see sleeves.py): core
+    buy-and-hold plus each signal, each with its own pool and symbols in
+    the same account."""
+    intro = '''
+      <h2>Strategy Comparison</h2>
+      <div class="hint">
+        Each strategy runs with its own pool of money and its own symbols inside the same paper account, so
+        their results can be read side by side. The most useful column is <strong>vs own buy &amp; hold</strong>:
+        how the signal did compared with simply buying its own symbols on day one and holding them. The
+        strategies trade different (but similar) stocks, so comparing their raw returns mostly shows which
+        stocks happened to rise; comparing each against its own buy-and-hold takes that luck out.
+        A round trip is one buy and the sell that closed it; the win rate is the share of round trips that made money.
+      </div>
+    '''
+    sleeves = (state or {}).get("sleeves") or {}
+    if not sleeves:
+        return intro + '<div class="empty">no strategy data yet -- start run.py to populate this section</div>'
+
+    experiment = (state or {}).get("experiment") or {}
+    started_at = experiment.get("started_at")
+    if not started_at:
+        status = ('<div class="verdict">No comparison has started yet. Run '
+                  '<code>python scripts/start_sleeve_experiment.py</code> (a dry run that changes nothing), then '
+                  'again with <code>--execute</code> while the market is open, to give each strategy its symbols '
+                  'and a fresh start.</div>')
+    else:
+        try:
+            days = (datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).days
+        except ValueError:
+            days = 0
+        signal_trips = [s.get("round_trips") or 0 for sid, s in sleeves.items() if sid != "core"]
+        fewest = min(signal_trips) if signal_trips else 0
+        if fewest < MIN_ROUND_TRIPS_FOR_A_VERDICT:
+            verdict = (f"<strong>Too early to tell.</strong> The least active strategy has {fewest} closed round "
+                       f"trip(s); with fewer than about {MIN_ROUND_TRIPS_FOR_A_VERDICT} each, differences between "
+                       "them are mostly luck.")
+            css = ""
+        else:
+            verdict = ("Every strategy has enough round trips for the comparison to start meaning something. "
+                       "Even so, a few months is one market mood, so treat it as evidence, not proof.")
+            css = " pos"
+        status = (f'<div class="verdict{css}">Running for {days} day(s), since {_escape(started_at[:10])}. '
+                  f"{verdict}</div>")
+
+    history = sleeve_history.read_all(SLEEVE_HISTORY_FILE)
+    drawdowns = _sleeve_max_drawdowns(history)
+    rows = ""
+    for sid, s in sleeves.items():
+        color = SLEEVE_COLORS.get(sid, "#e5e7eb")
+        label = s.get("label") or SLEEVE_LABELS.get(sid, sid)
+        win_rate = s.get("win_rate")
+        rows += (
+            f'<tr><td><span style="color:{color}">&#9632;</span> {_escape(label)}</td>'
+            f"<td>{len(s.get('symbols') or [])}</td>"
+            f"<td>${s.get('pool_usd', 0):,.2f}</td><td>${s.get('equity', 0):,.2f}</td>"
+            f"{_pct_cell(s.get('return_pct'))}{_pct_cell(s.get('benchmark_return_pct'))}"
+            f"{_pct_cell(s.get('excess_return_pct'))}"
+            f"<td>{'%.2f%%' % (drawdowns[sid] * 100) if sid in drawdowns else '-'}</td>"
+            f"<td>${s.get('cash', 0):,.2f}</td><td>{s.get('open_positions', 0)}</td>"
+            f"<td>{s.get('filled_orders', 0)}</td><td>{s.get('round_trips', 0)}</td>"
+            f"<td>{'%.0f%%' % (win_rate * 100) if win_rate is not None else '-'}</td></tr>"
+        )
+    table = f'''
+      <table>
+        <thead><tr><th>Strategy</th><th>Symbols</th><th>Started with</th><th>Worth now</th><th>Return</th>
+        <th>Own buy &amp; hold</th><th>vs own buy &amp; hold</th><th>Max drawdown</th><th>Cash</th>
+        <th>Holding</th><th>Filled orders</th><th>Round trips</th><th>Win rate</th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table>
+      <div class="hint">"Own buy &amp; hold" is blank for core because core IS buy-and-hold (of the core ETFs) --
+      it's the baseline every signal is ultimately trying to beat. Max drawdown is the worst fall from a
+      high point, measured once per day.</div>
+    '''
+
+    pools = {sid: s.get("pool_usd") or 0 for sid, s in sleeves.items()}
+    series = []
+    for sid, s in sleeves.items():
+        pts = {}
+        for entry in history:
+            snap = (entry.get("sleeves") or {}).get(sid) or {}
+            equity = snap.get("equity")
+            if isinstance(equity, (int, float)) and pools.get(sid):
+                pts[entry.get("date")] = equity / pools[sid] - 1.0
+        series.append((s.get("label") or SLEEVE_LABELS.get(sid, sid), SLEEVE_COLORS.get(sid, "#e5e7eb"), pts))
+
+    options = "".join(
+        f'<option value="{_escape(sid)}">{_escape(s.get("label") or SLEEVE_LABELS.get(sid, sid))}</option>'
+        for sid, s in sleeves.items()
+    )
+    details = "".join(_render_sleeve_detail(sid, s, state) for sid, s in sleeves.items())
+    return f'''
+      {intro}
+      {status}
+      {table}
+      <h2>Return Since the Start</h2>
+      <div class="hint">Each strategy's value as a percent gain or loss from its starting pool, one point per day.</div>
+      {_svg_multi_line(series)}
+      <h2>Strategy Detail</h2>
+      <select id="pt-sleeve-pick" onchange="ptPickSleeve(this.value)">{options}</select>
+      {details}
     '''
 
 
@@ -641,9 +898,9 @@ def _render_status_tab(state, selftest) -> str:
         config_html = f'''
           <table>
             <tbody>
-              <tr><td>Symbols</td><td>{_escape(", ".join(cfg_snap.get("symbols", [])))}</td></tr>
-              <tr><td>Signal</td><td>{_escape(cfg_snap.get("signal_kind"))}</td></tr>
-              <tr><td>Tactical trade size</td><td>${cfg_snap.get("target_trade_usd", 0):.2f}</td></tr>
+              <tr><td>Core symbols</td><td>{_escape(", ".join(cfg_snap.get("symbols", [])))}</td></tr>
+              <tr><td>Strategy sleeves</td><td>{_escape(", ".join(cfg_snap.get("strategy_sleeves") or [cfg_snap.get("signal_kind") or "-"]))}</td></tr>
+              <tr><td>Trade size</td><td>${cfg_snap.get("target_trade_usd", 0):.2f}</td></tr>
               <tr><td>Per-position cap</td><td>${cfg_snap.get("max_position_usd", 0):.2f}</td></tr>
               <tr><td>Concentration cap</td><td>{cfg_snap.get("max_concentration_pct", 0)*100:.0f}%</td></tr>
               <tr><td>Daily loss limit</td><td>{cfg_snap.get("daily_loss_limit_pct", 0)*100:.0f}%</td></tr>
@@ -712,8 +969,8 @@ def _render_risk_profile_controls(state) -> str:
     """The dashboard's one OTHER write path besides the kill switch (see
     module docstring) -- but narrowly scoped the same way: this can only
     ever adjust the 7 fields in safety.RISK_PROFILE_TUNABLE_FIELDS (position
-    sizing / caps / how many tactical positions can be open at once). It
-    cannot touch the symbol whitelist, the account type, or the same-day
+    sizing / caps / how many positions each strategy can have open). It
+    cannot touch which symbols any strategy trades, the account type, or the same-day
     round-trip check -- that check has no Config field behind it at all,
     so there is no lever here that could ever reach it, even in principle.
     """
@@ -744,41 +1001,43 @@ def _render_risk_profile_controls(state) -> str:
 
     rows = (
         field_row(
-            "target_trade_usd", "Tactical trade size", f'${eff.get("target_trade_usd", 0):.2f}', "e.g. 25",
-            "Dollar size of each NEW tactical buy the signal opens (sized into fractional shares). "
-            "Bigger = fewer, larger bets; smaller = more, smaller bets from the same capital.",
+            "target_trade_usd", "Trade size", f'${eff.get("target_trade_usd", 0):.2f}', "e.g. 25",
+            "Dollar size of each NEW buy a signal strategy opens (sized into fractional shares). "
+            "Bigger = fewer, larger bets; smaller = more, smaller bets from the same pool. Same for "
+            "every strategy, so the comparison stays fair.",
         )
         + field_row(
             "max_position_usd", "Per-position cap", f'${eff.get("max_position_usd", 0):.2f}', "e.g. 60",
-            "Hard dollar ceiling on any ONE tactical position. A buy that would push a position "
-            "past this is rejected outright, regardless of what the signal wants.",
+            "Hard dollar ceiling on any ONE position a signal strategy holds. A buy that would push a "
+            "position past this is rejected outright, regardless of what the signal wants.",
         )
         + field_row(
             "max_concentration_pct", "Concentration cap", f'{eff.get("max_concentration_pct", 0)*100:.0f}%', "e.g. 0.35 = 35%",
-            "Cap on any one position as a share of TOTAL account equity -- guards against one symbol "
-            "dominating the account even if max_position_usd alone would still allow it.",
+            "Cap on any one position as a share of its strategy's own money -- guards against one "
+            "symbol dominating a strategy even if max_position_usd alone would still allow it.",
         )
         + field_row(
             "cash_buffer_usd", "Cash buffer", f'${eff.get("cash_buffer_usd", 0):.2f}', "e.g. 10",
-            "Minimum cash the engine always leaves untouched -- a buy that would dip buying power "
-            "below this amount is refused.",
+            "Minimum cash each strategy always leaves untouched in its own pool -- a buy that would "
+            "dip below this amount is refused.",
         )
         + field_row(
             "daily_loss_limit_pct", "Daily loss limit", f'{eff.get("daily_loss_limit_pct", 0)*100:.0f}%', "e.g. 0.03 = 3%",
-            "Circuit breaker: if equity falls this much below where it started TODAY, the engine "
-            "automatically FLATTENs (cancels open orders, sells everything to cash).",
+            "Circuit breaker: if the strategies' money (all of them together) falls this much below "
+            "where it started TODAY, the engine automatically FLATTENs (cancels open orders, sells "
+            "everything to cash).",
         )
         + field_row(
             "max_drawdown_pct", "Max drawdown limit", f'{eff.get("max_drawdown_pct", 0)*100:.0f}%', "e.g. 0.15 = 15%",
-            "Circuit breaker: if equity falls this much below its ALL-TIME peak, the engine "
-            "automatically FLATTENs -- the longer-horizon sibling of the daily loss limit above.",
+            "Circuit breaker: if the strategies' money falls this much below its highest point, the "
+            "engine automatically FLATTENs -- the longer-horizon sibling of the daily loss limit above.",
         )
         + field_row(
-            "max_open_positions", "Max open tactical positions", f'{eff.get("max_open_positions", 0):g}', "e.g. 6",
-            "Cap on how many DIFFERENT tactical (non-core) symbols can be held open at once. Adding "
-            "to a symbol already open doesn't count against this -- it only blocks opening a NEW one "
-            "once the cap is hit, which is what keeps a wide symbol universe from becoming a pile of "
-            "tiny buys.",
+            "max_open_positions", "Max open positions", f'{eff.get("max_open_positions", 0):g}', "e.g. 6",
+            "Cap on how many DIFFERENT symbols each signal strategy can hold at once (each strategy "
+            "gets this many). Adding to a symbol already open doesn't count against this -- it only "
+            "blocks opening a NEW one once the cap is hit, which is what keeps a wide symbol list "
+            "from becoming a pile of tiny buys.",
         )
     )
 
@@ -798,18 +1057,19 @@ def _render_risk_profile_controls(state) -> str:
 
 def _render_locked_config(state) -> str:
     cfg_snap = (state or {}).get("config_snapshot") or {}
-    paper = _env("ALPACA_PAPER", "true").strip().lower() in ("1", "true", "yes", "on")
-    core_alloc_raw = _env("CORE_ALLOCATION_PCT", "0.5")
-    try:
-        core_alloc_pct = float(core_alloc_raw) * 100
-    except ValueError:
-        core_alloc_pct = 0.0
+    paper = _is_paper(state)
     symbols = ", ".join(cfg_snap.get("symbols", [])) or _escape(_env("SYMBOLS", "-"))
-    tactical_universe = cfg_snap.get("tactical_universe") or []
-    tactical_html = (
-        _escape(", ".join(tactical_universe)) if tactical_universe
-        else "none yet -- run scripts/refresh_tactical_universe.py"
-    )
+    core_pool = cfg_snap.get("core_pool_usd")
+    sleeve_pool = cfg_snap.get("sleeve_pool_usd")
+    sleeve_symbols = cfg_snap.get("sleeve_symbols") or {}
+    kinds = cfg_snap.get("strategy_sleeves") or [k.strip() for k in _env("STRATEGY_SLEEVES", _env("SIGNAL_KIND", "-")).split(",")]
+    sleeve_lines = []
+    for sid, syms in sleeve_symbols.items():
+        if sid == "core":
+            continue
+        listed = ", ".join(syms) if syms else "no symbols yet -- run scripts/start_sleeve_experiment.py"
+        sleeve_lines.append(f"<strong>{_escape(SLEEVE_LABELS.get(sid, sid))}</strong>: {_escape(listed)}")
+    sleeves_html = "<br>".join(sleeve_lines) or _escape(", ".join(kinds))
     return f'''
       <table>
         <thead><tr><th>Field</th><th>Value</th><th>What it does</th></tr></thead>
@@ -821,28 +1081,28 @@ def _render_locked_config(state) -> str:
             guard_live() refuses to start otherwise.</td>
           </tr>
           <tr>
-            <td>Core symbols (static, buy-and-hold)</td><td>{symbols}</td>
-            <td class="explain">The permanent whitelist -- bought ONCE and never sold by this bot, regardless of what
-            the tactical signal says. Captures the market's long-run drift no matter how the signal performs.</td>
+            <td>Core symbols (buy-and-hold)</td><td>{symbols}</td>
+            <td class="explain">The buy-and-hold core strategy's symbols -- bought ONCE and never sold by this bot.
+            Captures the market's long-run drift and is the baseline the signals are compared against. No signal
+            strategy ever trades these.</td>
           </tr>
           <tr>
-            <td>Tactical universe (dynamic, weekly refresh)</td><td>{tactical_html}</td>
-            <td class="explain">Extra symbols the tactical signal is ALSO currently allowed to trade, on top of the
-            core list above -- selected weekly by ranking a candidate pool by liquidity (see
-            scripts/refresh_tactical_universe.py). Purely additive: core symbols keep trading normally even if this
-            is empty.</td>
+            <td>Core pool</td><td>{"$%.2f" % core_pool if core_pool is not None else _escape(_env("CORE_POOL_USD", "500"))}</td>
+            <td class="explain">How much money the core strategy gets, split equally across the core symbols
+            (CORE_POOL_USD).</td>
           </tr>
           <tr>
-            <td>Core allocation</td><td>{core_alloc_pct:.0f}%</td>
-            <td class="explain">The fraction of seed capital permanently set aside into the core buy-and-hold sleeve
-            above, split equal-weight across the core symbols. The rest ("satellite") is what the tactical signal
-            actively trades.</td>
+            <td>Signal strategies and their symbols</td><td>{sleeves_html}</td>
+            <td class="explain">Which signals run, each as its own strategy with its own pool and its own symbols
+            (STRATEGY_SLEEVES) -- SMA crossover (trend-following), RSI reversion (mean-reversion), and an
+            experimental ML classifier. No symbol belongs to two strategies. The symbols are dealt out once, by
+            sector, when a comparison starts (scripts/start_sleeve_experiment.py), and stay fixed while it runs.
+            None of these signals has been shown to beat plain buy-and-hold (see the About tab).</td>
           </tr>
           <tr>
-            <td>Signal</td><td>{_escape(cfg_snap.get("signal_kind") or _env("SIGNAL_KIND", "-"))}</td>
-            <td class="explain">Which strategy is generating the tactical buy/sell decisions -- SMA crossover
-            (trend-following), RSI reversion (mean-reversion), or an experimental ML classifier. None of these have
-            been shown to beat plain buy-and-hold (see the About tab).</td>
+            <td>Pool per signal strategy</td><td>{"$%.2f" % sleeve_pool if sleeve_pool is not None else _escape(_env("SLEEVE_POOL_USD", "500"))}</td>
+            <td class="explain">How much money each signal strategy gets (SLEEVE_POOL_USD). A strategy can only ever
+            spend its own pool, however much the account holds.</td>
           </tr>
         </tbody>
       </table>
@@ -854,7 +1114,8 @@ def _render_config_tab(state) -> str:
       <h2>Risk Profile</h2>
       <div class="hint">
         Conservative / Normal / Aggressive only ever adjust position sizing, caps, and how many distinct
-        tactical positions can be open at once. Picking a profile can NEVER touch the symbol whitelist,
+        positions each strategy can have open at once -- the same values for every strategy, so the
+        comparison stays fair. Picking a profile can NEVER touch which symbols a strategy trades,
         the account type, or the same-day round-trip check -- that check has no configurable backing at
         all, so nothing on this page has a lever that could reach it. Selecting a profile resets any
         manual overrides below to that profile's defaults; a manual override on top of a profile persists
@@ -898,18 +1159,20 @@ def _render_about_tab() -> str:
         -- have cleared both bars against real historical data. That's an expected, honest result for a
         set of textbook/experimental signals, not a bug to fix by tuning harder.</p>
 
-        <p><strong>Core-satellite:</strong> because of that, a fixed fraction of seed capital is
-        permanently bought and held (never sold) across the core symbol whitelist, so at least part of
-        your capital captures the market's long-run drift regardless of whether the tactical signal ever
-        finds a real edge.</p>
+        <p><strong>Strategies side by side (see the Compare tab):</strong> the account is split into
+        separate strategies, each with its own pool of money and its own symbols. A buy-and-hold core
+        buys the core ETFs once and never sells, so part of your capital captures the market's
+        long-run drift no matter what. Next to it, each signal (SMA crossover, RSI reversion, the ML
+        classifier) trades its own set of similar stocks, so you can watch them against each other and
+        against simply holding. No symbol belongs to two strategies, and a strategy can never spend
+        another's money. Running several at once is a paper-trading experiment: with real money the
+        engine refuses unless you explicitly opt in.</p>
 
-        <p><strong>Risk profiles &amp; the tactical universe (see the Config tab):</strong> position
-        sizing and circuit-breaker caps can be switched between Conservative/Normal/Aggressive presets
-        (with manual overrides) live, without a restart -- but this can never touch the symbol whitelist,
-        the account type, or the same-day round-trip check below, since none of those have a
-        configurable backing at all. Separately, an optional weekly job can widen the tactical sleeve
-        with a small, liquidity-ranked pool of additional symbols on top of the static core list -- see
-        the Config tab's "Locked Configuration" section for what's currently active.</p>
+        <p><strong>Risk profiles (see the Config tab):</strong> position sizing and circuit-breaker caps
+        can be switched between Conservative/Normal/Aggressive presets (with manual overrides) live,
+        without a restart, and apply equally to every strategy -- but this can never touch which symbols
+        each strategy trades, the account type, or the same-day round-trip check, since none of those have
+        a configurable backing on this page at all.</p>
 
         <p><strong>Not financial advice.</strong> No part of this project should be read as a
         recommendation to trade any particular security. See README.md for the full setup checklist,
@@ -919,7 +1182,7 @@ def _render_about_tab() -> str:
 
 
 def _render_content() -> str:
-    """Everything that gets swapped on each auto-refresh -- all eight tab
+    """Everything that gets swapped on each auto-refresh -- all nine tab
     panels, with only the currently-selected one visible (client-side JS
     reapplies the selection after the swap, see showTab())."""
     state = _read_json(STATE_FILE)
@@ -928,7 +1191,9 @@ def _render_content() -> str:
     selftest = _read_json(SELFTEST_FILE)
 
     return f'''
+      {_render_live_multi_strategy_warning(state)}
       <div class="tab-panel active" data-tab="live">{_render_live_tab(state)}</div>
+      <div class="tab-panel" data-tab="compare">{_render_compare_tab(state)}</div>
       <div class="tab-panel" data-tab="killswitch">{_render_killswitch_tab()}</div>
       <div class="tab-panel" data-tab="events">{_render_events_tab(state)}</div>
       <div class="tab-panel" data-tab="backtest">{_render_backtest_tab(backtest)}</div>
@@ -1029,6 +1294,13 @@ def _render_page() -> str:
   .tab-link {{ color: #60a5fa; cursor: pointer; font-weight: 500; text-transform: none; letter-spacing: normal; }}
   .tab-link:hover {{ text-decoration: underline; }}
   .chart-wrap {{ cursor: crosshair; max-width: 900px; }}
+  td.pos {{ color: #34d399; }}
+  td.neg {{ color: #f87171; }}
+  code {{ background: #1f2229; padding: 1px 5px; border-radius: 3px; font-size: 12px; }}
+  select {{ background: #0f1115; border: 1px solid #2a2e37; color: #e5e7eb; border-radius: 4px;
+            padding: 5px 8px; font-size: 13px; margin-top: 8px; }}
+  .live-warning {{ background: #7f1d1d; border: 1px solid #f87171; color: #fee2e2; border-radius: 8px;
+                   padding: 10px 14px; margin: 12px 0; font-size: 13px; font-weight: 600; }}
   .chart-tooltip {{
     position: fixed; display: none; background: #1a1d24; border: 1px solid #3f4451;
     border-radius: 6px; padding: 6px 10px; font-size: 12px; color: #e5e7eb;
@@ -1041,12 +1313,13 @@ def _render_page() -> str:
     {_PAPER_TIGER_MARK}
     <div class="banner-text">
       <h1>PaperTiger</h1>
-      <div class="subtitle">This page cannot place orders. Its only write actions are the kill switch (stop or resume trading) and the Config tab's risk profile/overrides (position sizing and risk caps only) -- neither can touch the symbol whitelist, the account type, or the same-day round-trip check. Auto-refreshes every {REFRESH_SECONDS}s.</div>
+      <div class="subtitle">This page cannot place orders. Its only write actions are the kill switch (stop or resume trading) and the Config tab's risk profile/overrides (position sizing and risk caps only) -- neither can touch which symbols a strategy trades, the account type, or the same-day round-trip check. Auto-refreshes every {REFRESH_SECONDS}s.</div>
     </div>
   </div>
 
   <nav class="tabs">
     <button class="tab-btn active" data-tab="live" onclick="showTab('live')">Live</button>
+    <button class="tab-btn" data-tab="compare" onclick="showTab('compare')">Compare</button>
     <button class="tab-btn" data-tab="killswitch" onclick="showTab('killswitch')">Kill Switch</button>
     <button class="tab-btn" data-tab="events" onclick="showTab('events')">Events</button>
     <button class="tab-btn" data-tab="backtest" onclick="showTab('backtest')">Backtest</button>
@@ -1075,7 +1348,6 @@ def _render_page() -> str:
     // just enough JS to make a hand-rolled SVG line chart inspectable.
     function ptChartHover(evt, wrap) {{
       const svg = wrap.querySelector('svg');
-      const tip = document.getElementById('pt-chart-tooltip');
       if (!svg) return;
       const rect = svg.getBoundingClientRect();
       if (rect.width === 0) return;
@@ -1105,6 +1377,27 @@ def _render_page() -> str:
         }} catch (e) {{ /* malformed benchmark data -- just show the primary value */ }}
       }}
 
+      ptShowTooltip(evt, text);
+    }}
+
+    // Compare-tab chart: every strategy's % return on the date nearest the cursor.
+    function ptMultiHover(evt, wrap) {{
+      const svg = wrap.querySelector('svg');
+      if (!svg) return;
+      const rect = svg.getBoundingClientRect();
+      if (rect.width === 0) return;
+      const svgX = (evt.clientX - rect.left) * (svg.viewBox.baseVal.width / rect.width);
+      let points;
+      try {{ points = JSON.parse(wrap.dataset.multi || '[]'); }} catch (e) {{ return; }}
+      if (!points.length) return;
+      let nearest = points[0];
+      for (const p of points) {{ if (Math.abs(p.x - svgX) < Math.abs(nearest.x - svgX)) nearest = p; }}
+      const parts = nearest.values.map(([label, v]) => label + ' ' + (v >= 0 ? '+' : '') + (v * 100).toFixed(2) + '%');
+      ptShowTooltip(evt, nearest.date + ':  ' + parts.join('  |  '));
+    }}
+
+    function ptShowTooltip(evt, text) {{
+      const tip = document.getElementById('pt-chart-tooltip');
       tip.textContent = text;
       tip.style.display = 'block';
       // Measure AFTER setting text/display so offsetWidth/Height reflect
@@ -1129,11 +1422,29 @@ def _render_page() -> str:
         const html = await res.text();
         document.getElementById('pt-content').innerHTML = html;
         showTab(currentTab);
+        ptApplySleevePick();
       }} catch (e) {{
         // transient fetch error -- just try again next interval
       }}
     }}
     setInterval(refreshContent, {REFRESH_SECONDS * 1000});
+
+    // Compare tab's strategy picker -- remembered across auto-refreshes the
+    // same way currentTab is.
+    let currentSleeve = null;
+    function ptPickSleeve(id) {{
+      currentSleeve = id;
+      ptApplySleevePick();
+    }}
+    function ptApplySleevePick() {{
+      const sel = document.getElementById('pt-sleeve-pick');
+      if (!sel) return;
+      if (currentSleeve === null || !sel.querySelector('option[value="' + currentSleeve + '"]')) currentSleeve = sel.value;
+      sel.value = currentSleeve;
+      document.querySelectorAll('.sleeve-detail').forEach(el => {{
+        el.style.display = el.dataset.sleeve === currentSleeve ? 'block' : 'none';
+      }});
+    }}
 
     async function ptKill(action) {{
       if (action === 'flatten' && !confirm('FLATTEN cancels open orders and sells every position to cash. Continue?')) return;

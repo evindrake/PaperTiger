@@ -23,6 +23,10 @@ risk_profile.json
 risk_profile.json.tmp
 tactical_universe.json
 tactical_universe.json.tmp
+sleeves.json
+sleeves.json.tmp
+sleeve_history*.jsonl
+sleeve_history.jsonl.tmp
 ml_model.joblib
 selftest_results.json
 notifications.json

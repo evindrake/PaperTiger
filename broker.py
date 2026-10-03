@@ -33,6 +33,7 @@ from datetime import date, datetime, timezone
 from typing import Dict, List, Optional
 
 import requests
+from alpaca.common.enums import Sort
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical.stock import StockHistoricalDataClient
@@ -245,10 +246,45 @@ class Broker:
         try:
             order = self._trading.get_order_by_client_id(client_order_id)
         except (APIError, requests.exceptions.RequestException) as e:
-            if e.status_code == 404:
+            # Plain network exceptions have no status_code -- reading it
+            # directly would raise AttributeError and turn a DNS blip into a
+            # non-BrokerError (and so a non-auto-recoverable HALT).
+            if getattr(e, "status_code", None) == 404:
                 return None
             raise BrokerError(f"get_order_by_client_id failed: {e}") from e
         return self._normalize_order(order)
+
+    def orders_since(self, after: datetime, page_size: int = 500) -> List[OrderView]:
+        """Every order (any status) submitted after `after`, oldest first.
+        Pages forward by submission time, since Alpaca caps one response at
+        500 orders. The strategy sleeves' cash ledgers are rebuilt from
+        this every tick, so the broker stays the source of truth for what
+        each sleeve has actually spent and received."""
+        seen: Dict[str, OrderView] = {}
+        cursor = after
+        while True:
+            try:
+                raw_orders = self._trading.get_orders(
+                    filter=GetOrdersRequest(
+                        status=QueryOrderStatus.ALL, after=cursor, limit=page_size, direction=Sort.ASC,
+                    )
+                )
+            except (APIError, requests.exceptions.RequestException) as e:
+                raise BrokerError(f"get_orders(all since {after.isoformat()}) failed: {e}") from e
+            batch = [self._normalize_order(o) for o in raw_orders]
+            new = [o for o in batch if o.id not in seen]
+            for o in new:
+                seen[o.id] = o
+            if len(batch) < page_size or not new:
+                break
+            last = max((o.submitted_at for o in new if o.submitted_at is not None), default=None)
+            if last is None or last <= cursor:
+                break
+            cursor = last
+        return sorted(
+            seen.values(),
+            key=lambda o: o.submitted_at or datetime.min.replace(tzinfo=timezone.utc),
+        )
 
     def _normalize_order(self, o) -> OrderView:
         return OrderView(

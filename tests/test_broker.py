@@ -63,6 +63,9 @@ class _FakeTradingClient:
         self.last_assets_filter = None
         self.assets_to_return = []
         self.get_account_raises = None
+        self.get_order_raises = None
+        self.order_pages = []
+        self.orders_filters = []
 
     def submit_order(self, order_data):
         self.last_request = order_data
@@ -76,6 +79,13 @@ class _FakeTradingClient:
         if self.get_account_raises is not None:
             raise self.get_account_raises
         raise AssertionError("test must set get_account_raises before calling account()")
+
+    def get_order_by_client_id(self, client_order_id):
+        raise self.get_order_raises
+
+    def get_orders(self, filter=None):
+        self.orders_filters.append(filter)
+        return self.order_pages.pop(0) if self.order_pages else []
 
 
 def make_broker():
@@ -161,6 +171,53 @@ class TestNetworkFailuresAreWrappedAsBrokerError(unittest.TestCase):
         broker._trading.get_account_raises = requests.exceptions.Timeout("read timed out")
         with self.assertRaises(BrokerError):
             broker.account()
+
+    def test_order_lookup_network_error_becomes_broker_error(self):
+        # Regression: this used to read e.status_code, which a plain network
+        # exception doesn't have -- AttributeError instead of BrokerError.
+        broker = make_broker()
+        broker._trading.get_order_raises = requests.exceptions.ConnectionError("dns failed")
+        with self.assertRaises(BrokerError):
+            broker.order_by_client_id("pt-sma-AAPL-buy-2026-10-05")
+
+
+class _SdkOrder:
+    def __init__(self, oid, submitted_at):
+        self.id = oid
+        self.client_order_id = f"cid-{oid}"
+        self.symbol = "AAPL"
+        self.side = "buy"
+        self.status = "filled"
+        self.qty = "1"
+        self.notional = None
+        self.filled_qty = "1"
+        self.filled_avg_price = "100"
+        self.limit_price = "100"
+        self.submitted_at = submitted_at
+
+
+class TestOrdersSince(unittest.TestCase):
+    def test_pages_forward_until_a_short_page(self):
+        t0 = datetime(2026, 10, 5, tzinfo=timezone.utc)
+        from datetime import timedelta
+        broker = make_broker()
+        broker._trading.order_pages = [
+            [_SdkOrder("a", t0 + timedelta(minutes=1)), _SdkOrder("b", t0 + timedelta(minutes=2))],
+            [_SdkOrder("c", t0 + timedelta(minutes=3))],
+        ]
+        orders = broker.orders_since(t0, page_size=2)
+        self.assertEqual([o.id for o in orders], ["a", "b", "c"])
+        self.assertEqual(broker._trading.orders_filters[1].after, t0 + timedelta(minutes=2))
+
+    def test_failure_becomes_broker_error(self):
+        broker = make_broker()
+
+        def boom(filter=None):
+            raise requests.exceptions.ConnectionError("dns failed")
+
+        broker._trading.get_orders = boom
+        with self.assertRaises(BrokerError):
+            broker.orders_since(datetime(2026, 10, 5, tzinfo=timezone.utc))
 
 
 if __name__ == "__main__":

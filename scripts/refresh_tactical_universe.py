@@ -1,7 +1,11 @@
 """
-refresh_tactical_universe.py -- weekly job that (re)selects the dynamic
-satellite/tactical symbol pool the engine trades IN ADDITION TO the static
-core whitelist (cfg.symbols).
+refresh_tactical_universe.py -- weekly job that keeps a liquidity-ranked
+list of candidate stocks (tactical_universe.json) up to date. That ranked
+list is what scripts/start_sleeve_experiment.py deals out to the strategy
+sleeves when an experiment starts. Once an experiment is running its
+symbols are frozen in sleeves.json -- a controlled comparison needs fixed
+symbols -- so this weekly refresh does NOT change what any running sleeve
+trades; the engine doesn't read tactical_universe.json at all.
 
 Deliberately NOT a full scan of the US equity market: that would be slow,
 API-heavy, and pointless at this account size. Instead:
@@ -14,11 +18,9 @@ API-heavy, and pointless at this account size. Instead:
   3. For the survivors, pull cfg.tactical_universe_lookback_days of daily
      bars and rank by average dollar volume (avg_close * avg_volume) --
      picking liquid, easily-fillable names, not just "large index members."
-  4. Write the top cfg.tactical_universe_size of them to
-     tactical_universe.json (atomic tmp+rename), which engine.py reads
-     fresh every tick and merges on top of cfg.symbols -- core.py's
-     CoreAllocator never sees this file, so core bootstrap sizing is
-     unaffected by anything this script does.
+  4. Write the top cfg.tactical_universe_size of them, most liquid first,
+     to tactical_universe.json (atomic tmp+rename). Core symbols
+     (cfg.symbols) are never part of it.
 
 Run this on a schedule (weekly is plenty -- see scripts/install_services.ps1
 for the Windows Task Scheduler registration); it is safe to run more often
@@ -34,7 +36,7 @@ import json
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -54,6 +56,19 @@ def load_candidate_universe(path: str) -> List[str]:
     if not isinstance(symbols, list):
         return []
     return [s.strip().upper() for s in symbols if isinstance(s, str) and s.strip()]
+
+
+def load_candidate_sectors(path: str) -> Dict[str, str]:
+    """symbol -> sector from candidate_universe.json's "sectors" map (empty
+    on any problem -- every symbol then just counts as sector "other")."""
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    sectors = raw.get("sectors") if isinstance(raw, dict) else None
+    if not isinstance(sectors, dict):
+        return {}
+    return {k.strip().upper(): str(v) for k, v in sectors.items() if isinstance(k, str) and k.strip()}
 
 
 def rank_by_dollar_volume(broker: Broker, symbols: List[str], lookback_days: int) -> List[tuple]:
@@ -92,7 +107,8 @@ def main() -> None:
     cfg = load_config()
     broker = Broker(cfg)
 
-    candidates = load_candidate_universe(cfg.candidate_universe_file_path)
+    core = set(cfg.symbols)
+    candidates = [s for s in load_candidate_universe(cfg.candidate_universe_file_path) if s not in core]
     if not candidates:
         print(f"[refresh_tactical_universe] no candidates in {cfg.candidate_universe_file_path} -- nothing to do")
         write_tactical_universe(cfg.tactical_universe_file_path, [], {"candidates_considered": 0})

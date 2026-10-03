@@ -99,13 +99,13 @@ class MLModelBundle:
     horizon_days: int
 
 
-_model_cache: dict = {}  # model_path -> MLModelBundle, so we don't re-load from disk every tick
+# model_path -> (file mtime, MLModelBundle), so we don't re-load from disk
+# every tick -- but a nightly retrain (a newer file) IS picked up without
+# restarting the engine.
+_model_cache: dict = {}
 
 
 def load_model(model_path: str) -> MLModelBundle:
-    if model_path in _model_cache:
-        return _model_cache[model_path]
-
     import joblib
 
     path = Path(model_path)
@@ -114,13 +114,18 @@ def load_model(model_path: str) -> MLModelBundle:
             f"no trained model found at {model_path!r} -- run train_ml_signal.py first, "
             f"or set SIGNAL_KIND to sma_crossover/rsi_reversion instead."
         )
+    mtime = path.stat().st_mtime
+    cached = _model_cache.get(model_path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+
     bundle: MLModelBundle = joblib.load(path)
     if tuple(bundle.feature_names) != FEATURE_NAMES:
         raise ValueError(
             f"model at {model_path!r} was trained with feature order {bundle.feature_names}, "
             f"which doesn't match this code's current FEATURE_NAMES {FEATURE_NAMES} -- retrain it."
         )
-    _model_cache[model_path] = bundle
+    _model_cache[model_path] = (mtime, bundle)
     return bundle
 
 

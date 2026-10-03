@@ -42,8 +42,13 @@ Write-Host "Running walkforward.py ($Start to $Today)..."
 & $VenvPython walkforward.py --source alpaca --start $Start --end $Today --out walkforward_results.json 2>&1 |
     Tee-Object -FilePath $LogFile -Append
 
-Write-Host "Running train_ml_signal.py ($Start to $Today)..."
-& $VenvPython train_ml_signal.py --source alpaca --start $Start --end $Today --model-out ml_model.joblib 2>&1 |
+# Once a strategy-sleeve experiment is running (sleeves.json exists), the
+# model the live ML sleeve uses is trained on that sleeve's own symbols --
+# the engine picks up the new ml_model.joblib on its next tick, no restart.
+$TrainArgs = @("train_ml_signal.py", "--source", "alpaca", "--start", $Start, "--end", $Today, "--model-out", "ml_model.joblib")
+if (Test-Path (Join-Path $ProjectDir "sleeves.json")) { $TrainArgs += @("--sleeve", "ml") }
+Write-Host "Running $($TrainArgs -join ' ')..."
+& $VenvPython @TrainArgs 2>&1 |
     Tee-Object -FilePath $LogFile -Append
 
 "=== done: $(Get-Date -Format s) ===" | Add-Content -Path $LogFile

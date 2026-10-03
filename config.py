@@ -13,9 +13,11 @@ human-driven risk-profile override (see safety.RiskProfileStore) can
 substitute different values for a small allow-listed subset of fields --
 position sizing and circuit-breaker caps only -- on each tick, without a
 restart. See engine.Engine._build_effective_cfg. Everything else --
-symbols, account type, signal identity, and the same-day round-trip check
--- has no override path at all; changing any of those still requires
-editing .env and restarting.
+account type, which signals run (STRATEGY_SLEEVES), and the same-day
+round-trip check -- has no override path at all; changing any of those
+still requires editing .env and restarting. (Which symbols each strategy
+sleeve trades lives in sleeves.json, written by
+scripts/start_sleeve_experiment.py, not here -- see sleeves.py.)
 
 guard_live() is the other safety-relevant piece here: it is the single
 choke point that decides whether this process is allowed to touch a live
@@ -111,9 +113,9 @@ class Config:
     state_file_path: str
     history_lookback_days: int  # how many daily bars to keep cached per symbol
     risk_profile_file_path: str      # live-reloadable conservative/normal/aggressive profile + overrides
-    candidate_universe_file_path: str  # static, user-editable pool of symbols eligible for the tactical universe
-    tactical_universe_file_path: str   # weekly-refreshed subset of the candidate pool actually traded
-    tactical_universe_size: int        # how many top-liquidity candidates to select each refresh
+    candidate_universe_file_path: str  # static, user-editable pool of stocks (with sectors) the signal sleeves draw from
+    tactical_universe_file_path: str   # weekly liquidity ranking of that pool -- dealt out to sleeves when an experiment starts
+    tactical_universe_size: int        # how many top-liquidity candidates to keep in that ranking
     tactical_universe_lookback_days: int  # bars window used to rank candidates by dollar volume
 
     # --- Signal parameters (fed into signals.Signal) ---
@@ -127,8 +129,9 @@ class Config:
     signal_ml_buy_threshold: float  # only used when signal_kind == "ml_classifier"
     signal_ml_sell_threshold: float  # only used when signal_kind == "ml_classifier"
 
-    # --- Core-satellite split (see core.py) ---
-    core_allocation_pct: float   # fraction of seed_usd permanently buy-and-held, equal-weight, never sold
+    # --- Core-satellite split for the OFFLINE tools (backtest/walkforward) ---
+    # The live engine sizes core from core_pool_usd instead (see core.py).
+    core_allocation_pct: float   # fraction of seed_usd buy-and-held in backtests, equal-weight, never sold
     core_holdings_file_path: str
 
     # --- Notifications (see notify.py) -- all optional, entirely free ---
@@ -145,6 +148,19 @@ class Config:
 
     # --- Live equity/positions history (see equity_history.py) ---
     equity_history_file_path: str
+
+    # --- Strategy sleeves (see sleeves.py) ---
+    # Signal kinds that each run as their own sleeve with their own cash pool
+    # and their own symbols. Empty means "just signal_kind" -- one sleeve.
+    strategy_sleeves: Tuple[str, ...] = ()
+    core_pool_usd: float = 500.0     # buy-and-hold core sleeve's budget, split equally across `symbols`
+    sleeve_pool_usd: float = 500.0   # budget for EACH signal sleeve
+    sleeves_file_path: str = "sleeves.json"
+    sleeve_history_file_path: str = "sleeve_history.jsonl"
+
+    def sleeve_kinds(self) -> Tuple[str, ...]:
+        """The signal kinds that run as sleeves, in display order."""
+        return self.strategy_sleeves or (self.signal_kind,)
 
     def guard_live(self) -> None:
         """Refuse to proceed toward a LIVE (real-money) account unless the
@@ -169,6 +185,19 @@ class Config:
                 "hard stop, not a suggestion -- set both deliberately in your "
                 ".env if you truly intend to trade real money."
             )
+        # Running several signals side by side is an experiment for paper
+        # money. With real money it splits a small account into even
+        # smaller pools and multiplies the ways things can go wrong, so it
+        # needs its own separate, explicit opt-in.
+        if len(self.sleeve_kinds()) > 1:
+            multi_raw = os.getenv("ALLOW_MULTI_STRATEGY_LIVE", "")
+            if multi_raw.strip().lower() != "yes":
+                raise RuntimeError(
+                    f"Refusing to run {len(self.sleeve_kinds())} strategy sleeves "
+                    f"({', '.join(self.sleeve_kinds())}) against a LIVE account. Multi-strategy "
+                    "comparison is meant for paper trading. Set STRATEGY_SLEEVES to a single "
+                    "signal, or set ALLOW_MULTI_STRATEGY_LIVE=yes if you truly intend this."
+                )
 
 
 def load_config(env_path: str | None = None) -> Config:
@@ -207,7 +236,7 @@ def load_config(env_path: str | None = None) -> Config:
         risk_profile_file_path=_get_str("RISK_PROFILE_FILE_PATH", "risk_profile.json"),
         candidate_universe_file_path=_get_str("CANDIDATE_UNIVERSE_FILE_PATH", "candidate_universe.json"),
         tactical_universe_file_path=_get_str("TACTICAL_UNIVERSE_FILE_PATH", "tactical_universe.json"),
-        tactical_universe_size=_get_int("TACTICAL_UNIVERSE_SIZE", 25),
+        tactical_universe_size=_get_int("TACTICAL_UNIVERSE_SIZE", 30),
         tactical_universe_lookback_days=_get_int("TACTICAL_UNIVERSE_LOOKBACK_DAYS", 20),
         signal_fast=_get_int("SIGNAL_FAST", 10),
         signal_slow=_get_int("SIGNAL_SLOW", 30),
@@ -229,7 +258,21 @@ def load_config(env_path: str | None = None) -> Config:
         notify_local_file_path=_get_str("NOTIFY_LOCAL_FILE_PATH", "notifications.json"),
         trade_log_file_path=_get_str("TRADE_LOG_FILE_PATH", "trade_history.jsonl"),
         equity_history_file_path=_get_str("EQUITY_HISTORY_FILE_PATH", "equity_history.jsonl"),
+        strategy_sleeves=tuple(k.lower() for k in _get_csv_list("STRATEGY_SLEEVES")),
+        core_pool_usd=_get_float("CORE_POOL_USD", 500.0),
+        sleeve_pool_usd=_get_float("SLEEVE_POOL_USD", 500.0),
+        sleeves_file_path=_get_str("SLEEVES_FILE_PATH", "sleeves.json"),
+        sleeve_history_file_path=_get_str("SLEEVE_HISTORY_FILE_PATH", "sleeve_history.jsonl"),
     )
+
+    from sleeves import SLEEVE_IDS  # local import: sleeves.py imports nothing from here at module level
+
+    kinds = cfg.sleeve_kinds()
+    unknown = [k for k in kinds if k not in SLEEVE_IDS]
+    if unknown:
+        raise ValueError(f"STRATEGY_SLEEVES has unknown signal kind(s) {unknown}; known: {list(SLEEVE_IDS)}")
+    if len(set(kinds)) != len(kinds):
+        raise ValueError(f"STRATEGY_SLEEVES lists the same signal kind more than once: {list(kinds)}")
 
     if not cfg.alpaca_paper:
         cfg.guard_live()

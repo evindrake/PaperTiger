@@ -77,9 +77,17 @@ def main() -> None:
     parser.add_argument("--test-frac", type=float, default=0.25, help="fraction of EACH symbol's data held out, chronologically, for testing")
     parser.add_argument("--model-type", choices=["logistic", "gradient_boosting"], default="logistic")
     parser.add_argument("--model-out", default="ml_model.joblib")
+    parser.add_argument("--sleeve", default=None,
+                        help="train on one strategy sleeve's own symbols (e.g. 'ml', see sleeves.json) "
+                             "instead of the core SYMBOLS list")
     args = parser.parse_args()
 
     cfg = load_config()
+    if args.sleeve:
+        from sleeves import cfg_for_sleeve
+
+        cfg = cfg_for_sleeve(cfg, args.sleeve)
+        print(f"[train_ml_signal] training on sleeve {args.sleeve!r}: {', '.join(cfg.symbols)}")
 
     bars_by_symbol: Dict[str, List[Bar]] = {}
     if args.source == "csv":

@@ -320,9 +320,16 @@ def main() -> None:
     parser.add_argument("--slippage-bps", type=float, default=5.0)
     parser.add_argument("--commission-usd", type=float, default=0.0)
     parser.add_argument("--out", default="walkforward_results.json")
+    parser.add_argument("--sleeve", default=None,
+                        help="validate one strategy sleeve (e.g. 'rsi') on its own symbols and signal -- "
+                             "see sleeves.json")
     args = parser.parse_args()
 
     cfg = load_config()
+    if args.sleeve:
+        from sleeves import cfg_for_sleeve
+
+        cfg = cfg_for_sleeve(cfg, args.sleeve)
     bt_cfg = BacktestConfig(
         initial_capital=cfg.seed_usd,
         slippage_bps=args.slippage_bps,

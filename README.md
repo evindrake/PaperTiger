@@ -62,42 +62,112 @@ to exercise the plumbing (signal -> order -> risk check -> fill) and to
 compare different ideas honestly, not because any of them is expected to
 make money. Don't mistake "the bot runs" for "the strategy works."
 
-Because of that, this project also supports a **core-satellite split**
-(see `core.py`): permanently set aside a fixed fraction of your seed
-capital (`CORE_ALLOCATION_PCT`, default 50%) into an equal-weight
-buy-and-hold position across the whitelist, bought once and never sold by
-the bot. That guarantees at least part of your capital captures the
-market's long-run drift regardless of whether the tactical signal ever
-finds a real edge. Set `CORE_ALLOCATION_PCT=0` to disable it entirely.
+Because of that, part of the account is always a plain **buy-and-hold
+core** (see `core.py`): a fixed pool (`CORE_POOL_USD`, default $500) bought
+once, equal-weight across the core `SYMBOLS`, and never sold by the bot.
+That guarantees at least part of your capital captures the market's
+long-run drift regardless of whether any signal ever finds a real edge --
+and it's the baseline every signal is measured against.
 
-## Risk profiles & the dynamic tactical universe
+## Comparing strategies side by side (strategy sleeves)
 
-Two more knobs, both live-adjustable from the dashboard's **Config** tab
-without restarting anything:
+Instead of running one signal and wondering how the others would have
+done, the engine can run all three at once in the same (paper) account,
+each as its own **sleeve** with its own pool of money and its own symbols
+(see `sleeves.py`):
 
-- **Risk profile** (Conservative / Normal / Aggressive): a named preset
-  over exactly 7 sizing/circuit-breaker fields (trade size, per-position
-  cap, concentration cap, cash buffer, daily loss limit, max drawdown,
-  and `max_open_positions`), plus optional manual overrides on top. Picked
-  from the dashboard, written to `risk_profile.json`, and re-read fresh by
-  the engine every tick -- see `safety.RiskProfileStore`. This can **never**
-  touch the symbol whitelist, the account type, or the same-day round-trip
-  check: those have no configurable backing at all, so there is no lever
-  on this page that could reach them, even in principle. A missing or
-  corrupted `risk_profile.json` changes nothing -- it fails closed to
-  whatever `.env` already says, never to a preset's hardcoded numbers.
-- **Dynamic tactical/satellite universe**: `SYMBOLS` in `.env` remains the
-  static **core** whitelist (drives `core.py`'s bootstrap sizing and never
-  changes automatically). Separately, `candidate_universe.json` is a small,
-  static, user-editable pool of well-known liquid US stocks; a weekly job
-  (`scripts/refresh_tactical_universe.py`) confirms which candidates are
-  currently tradable, ranks the survivors by recent dollar volume, and
-  writes the top `TACTICAL_UNIVERSE_SIZE` (default 25) to
-  `tactical_universe.json`. The engine reads that file fresh every tick and
-  trades it **in addition to** (never instead of) the core symbols.
-  `MAX_OPEN_POSITIONS` (also profile-tunable) caps how many *distinct*
-  tactical symbols can be open at once, so a wider universe can't turn into
-  a pile of tiny buys.
+| Sleeve | Trades | Pool |
+|---|---|---|
+| Buy & hold (core) | the core `SYMBOLS` (SPY, QQQ, VTI, IVV, BND, GLD), bought once, never sold | `CORE_POOL_USD` |
+| SMA crossover | ~10 liquid stocks of its own | `SLEEVE_POOL_USD` |
+| RSI reversion | ~10 different, similar stocks | `SLEEVE_POOL_USD` |
+| ML classifier | ~10 more | `SLEEVE_POOL_USD` |
+
+Which signals run is `STRATEGY_SLEEVES` in `.env` (empty = just
+`SIGNAL_KIND`, one sleeve). How it stays safe inside one account:
+
+- **No symbol belongs to two sleeves**, and no signal sleeve ever touches
+  a core symbol. Every position at the broker therefore belongs to exactly
+  one sleeve, by its ticker -- no splitting shares between strategies, no
+  two strategies sending opposite orders for the same stock, and the
+  existing per-symbol safety rules (same-day round trip, duplicate order,
+  position cap) keep working unchanged. If `sleeves.json` ever lists a
+  symbol twice, it's dropped from every sleeve (fail closed).
+- **Each sleeve has its own cash.** The account only has one cash balance,
+  so each sleeve's cash is rebuilt every tick from the broker's own order
+  history: its pool, minus what its filled buys cost, minus what its
+  still-open buys could cost, plus what its sells brought in. Every sleeve
+  order carries the sleeve's name in its order id
+  (`pt-sma-AAPL-buy-2026-10-05`), which is how it's attributed. The
+  engine then hands each sleeve a view of the account scoped to that
+  money, so the same pre-trade checks as always apply per sleeve -- a
+  sleeve can never spend another's pool, however much the account holds.
+- **Circuit breakers measure the strategies' money** (all sleeves
+  together), not the whole account. A paper account starts with ~$100k,
+  so a 3% daily-loss limit on the account would be $3,000 -- more than the
+  strategies even have -- and could never trip.
+- **Running more than one signal with real money is refused** unless you
+  set `ALLOW_MULTI_STRATEGY_LIVE=yes` on top of the usual live-money flags
+  (and the dashboard then shows a red warning banner on every tab). It's a
+  paper-trading experiment: with real money it would split a small account
+  into even smaller pools.
+
+**Starting a comparison** (stop the engine first):
+
+```
+python scripts/refresh_tactical_universe.py      # re-rank the candidate stocks by liquidity
+python scripts/start_sleeve_experiment.py        # dry run: prints what it would do, changes nothing
+python scripts/start_sleeve_experiment.py --execute   # market must be open
+```
+
+With `--execute` it (1) sells every position that isn't core, so all three
+signals start from cash on the same day; (2) tops each core symbol up to
+its share of `CORE_POOL_USD`; (3) deals the ranked `tactical_universe.json`
+out to the signal sleeves sector by sector (using the `sectors` map in
+`candidate_universe.json`), so each gets a similar mix -- some big tech, a
+bank, a health-care or consumer name -- and no sleeve always gets the most
+liquid name; and (4) records every symbol's starting price and writes
+`sleeves.json`. Each sleeve's symbols then **stay fixed** for the whole
+experiment; the weekly universe refresh doesn't change them (re-run with
+`--restart` to start over). It refuses to run against a live account,
+while the engine is still running, or with orders still open.
+
+**Reading the results** -- the dashboard's **Compare** tab shows each
+sleeve's value, return, max drawdown, trades, round trips and win rate,
+plus one chart of every sleeve's % return since the start. The column
+that matters most is **vs own buy & hold**: how the signal did compared
+with simply buying its own symbols on day one and holding them. The
+sleeves trade different stocks, so their raw returns mostly show which
+stocks happened to rise; each sleeve against its own buy-and-hold takes
+that luck out. Until every signal has around 30 closed round trips, the
+tab says "too early to tell" -- and even a few months is one market mood,
+so treat the result as evidence, not proof.
+
+The ML sleeve needs a model trained on its own symbols:
+`python train_ml_signal.py --source alpaca --start <date> --end <date> --sleeve ml`
+(the nightly retrain does this automatically once `sleeves.json` exists,
+and the engine picks up a retrained model without a restart). Until the
+model file exists the ML sleeve just sits out, with one warning a day --
+the other sleeves keep trading. `backtest.py` and `walkforward.py` accept
+`--sleeve <sma|rsi|ml>` too, to test one sleeve's signal on its own
+symbols.
+
+## Risk profiles
+
+Live-adjustable from the dashboard's **Config** tab without restarting
+anything: a named preset (Conservative / Normal / Aggressive) over exactly
+7 sizing/circuit-breaker fields (trade size, per-position cap,
+concentration cap, cash buffer, daily loss limit, max drawdown, and
+`max_open_positions`), plus optional manual overrides on top. Picked from
+the dashboard, written to `risk_profile.json`, and re-read fresh by the
+engine every tick -- see `safety.RiskProfileStore`. The same values apply
+to every signal sleeve (so the comparison stays fair); `max_open_positions`
+is per sleeve. This can **never** touch which symbols a sleeve trades, the
+account type, or the same-day round-trip check: those have no configurable
+backing on that page at all, so there is no lever there that could reach
+them, even in principle. A missing or corrupted `risk_profile.json`
+changes nothing -- it fails closed to whatever `.env` already says, never
+to a preset's hardcoded numbers.
 
 ## Setup checklist
 
@@ -135,9 +205,9 @@ mode, and going live is a separate, deliberate, multi-step opt-in (step 4)
    with each other and didn't diversify anything) -- this list has not been
    deliberated as a live-money allocation and should be re-examined,
    not just carried over, when that day comes. The same goes for
-   `candidate_universe.json` if you've enabled the dynamic tactical
-   universe (see below) -- it's a hand-picked starter list, not a
-   deliberated live-money allocation either.
+   `candidate_universe.json` (the stocks the signal sleeves are dealt
+   from, see above) -- it's a hand-picked starter list, not a deliberated
+   live-money allocation either.
 
 ## Typical session runbook
 
@@ -164,11 +234,18 @@ python walkforward.py
 python train_ml_signal.py --source csv
 SIGNAL_KIND=ml_classifier python walkforward.py
 
+# 3c. Give each strategy sleeve its symbols and a clean start (see
+#     "Comparing strategies side by side" above) -- without sleeves.json the
+#     signal sleeves have no symbols and only the buy-and-hold core trades:
+python scripts/refresh_tactical_universe.py
+python scripts/start_sleeve_experiment.py            # dry run first
+python scripts/start_sleeve_experiment.py --execute  # market hours
+
 # 4. Only if 2 and 3 actually hold up (beats buy-and-hold, survives OOS,
 #    stable parameters): start the watchdog, the dashboard, and the engine.
 #    Three separate processes/terminals:
 python watchdog.py
-python dashboard.py          # http://127.0.0.1:8787 (Live/Kill Switch/Events/Backtest/Walk-Forward/Status/Config/About tabs)
+python dashboard.py          # http://127.0.0.1:8787 (Live/Compare/Kill Switch/Events/Backtest/Walk-Forward/Status/Config/About tabs)
 python run.py                 # the live (paper, by default) trading loop
 ```
 
@@ -205,23 +282,26 @@ stays exactly as manual as ever.
 | `signals.py` | The single source of truth for buy/sell/hold logic (SMA crossover, RSI reversion, ML classifier). Both live and backtest import from here. |
 | `ml_signal.py` | Feature engineering + model loading for the experimental `ml_classifier` signal. The one deliberate exception to `signals.py`'s "no I/O" rule. |
 | `train_ml_signal.py` | Trains the scikit-learn model `ml_signal.py` loads, with a chronological (never shuffled) train/test split. |
-| `core.py` | Core-satellite bootstrap: buys and permanently holds a fixed fraction of capital, equal-weight, never sold. |
+| `core.py` | The buy-and-hold core sleeve: buys `CORE_POOL_USD` once, equal-weight across the core `SYMBOLS`, never sold. |
+| `sleeves.py` | Strategy sleeves: which symbols and pool each strategy owns (`sleeves.json`, fail-closed loader that drops any symbol listed twice), each sleeve's cash/value rebuilt from the broker's order history, its own-symbols buy-and-hold benchmark, and the sector-balanced symbol dealing. No broker access. |
+| `sleeve_history.py` | One line per day (`sleeve_history.jsonl`, never pruned) of every sleeve's value -- feeds the Compare tab's chart. |
 | `broker.py` | The *only* module that talks to Alpaca. Normalizes SDK objects into plain dataclasses; every call site raises `BrokerError` uniformly, whether the failure was Alpaca's API itself or the underlying network (DNS, timeout, connection refused). |
-| `strategy.py` | Thin, pure adapter: signal -> dollar-sized `OrderIntent`, aware of the core-satellite carve-out. Cannot place orders itself. |
+| `strategy.py` | Thin, pure adapter: signal -> dollar-sized `OrderIntent`, tagged with its sleeve in the order id. Cannot place orders itself. |
 | `safety.py` | Kill switch (manual by design, with one self-verifying auto-clear exception for broker-connectivity HALTs -- see above), live-reloadable risk profile presets/overrides (`RiskProfileStore`), circuit breakers, pre-trade validation (including an independent core-carve-out guard). |
-| `engine.py` | The live loop: fold in risk profile + tactical universe -> kill check (auto-probes/resumes a broker-connectivity HALT, otherwise obeys it) -> broker truth -> reconcile -> breakers -> core bootstrap -> propose -> round-trip/position-cap filter -> validate -> submit -> snapshot. |
+| `engine.py` | The live loop: fold in risk profile + sleeves -> kill check (auto-probes/resumes a broker-connectivity HALT, otherwise obeys it) -> broker truth -> reconcile -> rebuild each sleeve's cash -> breakers (on the strategies' money) -> core bootstrap -> for each signal sleeve, on its own symbols and cash: propose -> round-trip/position-cap filter -> validate -> submit -> snapshot. |
 | `watchdog.py` | Separate stdlib-only process. Its only power: creating the kill file if the engine's heartbeat goes stale. |
-| `backtest.py` | Offline simulator. Same caps as live, fills at next bar's open, buy-and-hold benchmark, core-satellite support. |
-| `walkforward.py` | Train/test parameter sweep + out-of-sample verdict, signal-agnostic (grid picked from `SIGNAL_KIND`). |
+| `backtest.py` | Offline simulator. Same caps as live, fills at next bar's open, buy-and-hold benchmark, core-satellite support. `--sleeve <id>` tests one sleeve's signal on its own symbols. |
+| `walkforward.py` | Train/test parameter sweep + out-of-sample verdict, signal-agnostic (grid picked from `SIGNAL_KIND`, or the sleeve's signal with `--sleeve <id>`). |
 | `sweep_signal_params.py` | Quick single-pass comparison across many parameter combos -- exploration only, NOT a substitute for walk-forward. |
-| `dashboard.py` | Stdlib HTTP status page, tabbed (Live/Kill Switch/Events/Backtest/Walk-Forward/Status/Config/About), with beginner-friendly explanations and a kill-switch control (HALT/FLATTEN also send a notification and kick off a background self-test). The Config tab additionally lets you pick a risk profile and set manual per-field overrides (see `safety.RiskProfileStore`) -- still cannot place a trade or touch the symbol whitelist. Optionally reachable from your phone over Tailscale (`--tailscale`, off by default) -- see "Remote access from your phone" below. |
+| `dashboard.py` | Stdlib HTTP status page, tabbed (Live/Compare/Kill Switch/Events/Backtest/Walk-Forward/Status/Config/About), with beginner-friendly explanations and a kill-switch control (HALT/FLATTEN also send a notification and kick off a background self-test). The Compare tab shows the strategy sleeves side by side. The Config tab additionally lets you pick a risk profile and set manual per-field overrides (see `safety.RiskProfileStore`) -- still cannot place a trade or change which symbols any strategy trades. Optionally reachable from your phone over Tailscale (`--tailscale`, off by default) -- see "Remote access from your phone" below. |
 | `preflight.py` | Pre-run checks. Never places an order. |
 | `run.py` | Entrypoint: wires config -> broker -> strategy -> engine. |
-| `scripts/refresh_tactical_universe.py` | Weekly job: ranks `candidate_universe.json` by liquidity and writes the top symbols to `tactical_universe.json` -- the dynamic satellite pool the engine trades in addition to the static core `SYMBOLS`. |
+| `scripts/refresh_tactical_universe.py` | Weekly job: ranks `candidate_universe.json` by liquidity and writes the top symbols to `tactical_universe.json` -- the pool `start_sleeve_experiment.py` deals out to the signal sleeves. Doesn't change a running experiment's symbols. |
+| `scripts/start_sleeve_experiment.py` | One-time start of a strategy comparison: sells everything that isn't core, tops core up to its pool, deals symbols to the sleeves by sector, records start prices, writes `sleeves.json`. Dry run by default; paper only. |
 | `generate_synthetic_data.py` | Writes fake OHLCV CSVs into `data/` for offline testing. |
 | `selftest.py` | Runs the full unit test suite programmatically, writes `selftest_results.json` for the dashboard's Status tab. A health check for unattended deployments, not a dev-testing replacement. |
 | `notify.py` | Optional, free-by-construction email/SMS notifications (plain SMTP + carrier email-to-SMS gateways) for HALT/FLATTEN/watchdog events. Always writes a local record for the desktop notifier (`scripts/tray_notifier.ps1` on Windows, `scripts/notifier.sh` on Linux/macOS) too. Never raises. |
-| `trade_log.py` | Durable, append-only JSONL record (`trade_history.jsonl`) of every order submitted (tactical and core-satellite bootstrap) -- independent of the rolling 200-entry event log and the broker's own history. |
+| `trade_log.py` | Durable, append-only JSONL record (`trade_history.jsonl`) of every order submitted (each sleeve's, and the core bootstrap) -- independent of the rolling 200-entry event log and the broker's own history. |
 | `equity_history.py` | Self-pruning JSONL log (`equity_history.jsonl`, one snapshot per engine tick, last 35 days kept) of equity/cash/per-symbol position value -- feeds the Live tab's "Last 30 Days" performance chart. |
 
 ## Running unattended
@@ -231,10 +311,11 @@ All three platforms install the same shape of thing: `watchdog.py`,
 services; a daily task that reruns `backtest.py` + `walkforward.py` +
 `train_ml_signal.py` against fresh data (the part that keeps searching for
 a better configuration -- `run.py` itself only ever executes whatever
-signal is currently set in `.env`); a **weekly** task that reruns
-`scripts/refresh_tactical_universe.py` to re-rank the dynamic tactical
-universe by liquidity (see "Risk profiles & the dynamic tactical universe"
-above); a periodic self-test (`selftest.py`, at startup/login and every 4
+signals are currently set in `.env`; once a strategy comparison is running,
+the ML model is retrained on the ML sleeve's own symbols); a **weekly**
+task that reruns `scripts/refresh_tactical_universe.py` to re-rank the
+candidate stocks by liquidity (see "Comparing strategies side by side"
+above -- it doesn't change a running comparison); a periodic self-test (`selftest.py`, at startup/login and every 4
 hours) that catches environment drift in the unattended deployment itself,
 separate from `preflight.py` (which checks the account, not the code); and
 a desktop notification popup for HALT/FLATTEN/watchdog events, which -- on
@@ -334,7 +415,7 @@ kill switch. Two channels, both free:
 
 A durable, independent trade history also gets written to
 `trade_history.jsonl` (one JSON object per line) for every order this bot
-submits, tactical or core-satellite bootstrap -- unlike the dashboard's
+submits, each sleeve's or the core bootstrap -- unlike the dashboard's
 rolling 200-entry event log, this file is never trimmed or reset on
 restart.
 
@@ -427,12 +508,15 @@ git config core.hooksPath .githooks
 - Slippage/commission are flat, configurable assumptions, not a market-impact model.
 - No T+1 settlement modeling in the backtest simulator (unlike the live engine,
   which structurally refuses same-day round trips -- see `Engine._is_same_day_round_trip`).
-- The core whitelist is small and static -- survivorship bias is real even for
-  "boring" ETFs. The optional dynamic tactical universe doesn't fully escape
-  this either: it only ever selects from `candidate_universe.json`, a small,
-  hand-picked starter list, not a real index membership feed -- it changes
-  *which* liquid large-caps get considered week to week, not the underlying
-  selection bias of "someone picked this list by hand."
+- The core list is small and static -- survivorship bias is real even for
+  "boring" ETFs. The signal sleeves' stocks don't fully escape this either:
+  they only ever come from `candidate_universe.json`, a small, hand-picked
+  starter list, not a real index membership feed.
+- The strategy comparison runs each signal on DIFFERENT stocks, so luck in
+  which stocks a sleeve was dealt is mixed into its result. Comparing each
+  sleeve with buy-and-hold of its own stocks (the Compare tab's key column)
+  removes most of that, not all of it. And a couple of months of paper
+  trading is a few dozen trades per sleeve -- one market mood, not a verdict.
 - A backtest or even a walk-forward pass is evidence, not proof, of a forward edge.
 - All three bundled signals (SMA crossover, RSI reversion, ML classifier) are
   placeholders/experiments. It is not investment advice, and no part of this

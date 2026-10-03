@@ -18,6 +18,7 @@ from broker import AccountSnapshot, BrokerError, OrderView, Position, Quote
 from config import Config
 from engine import Engine
 from safety import BROKER_CONNECTIVITY_HALT_REASON, KillMode, KillSwitch, RiskProfileStore
+from sleeves import write_sleeves_file
 
 
 class FakeBroker:
@@ -36,6 +37,7 @@ class FakeBroker:
         self.submitted_buys = []
         self.submitted_sells = []
         self._orders_by_cid = {}  # client_order_id -> OrderView, for simulating pre-existing orders
+        self._all_orders = []  # every order "submitted" here, for orders_since()
         self.fail_account_with = None  # set to an Exception to make account() raise it
 
     def account(self):
@@ -65,21 +67,29 @@ class FakeBroker:
     def order_by_client_id(self, client_order_id):
         return self._orders_by_cid.get(client_order_id)
 
+    def orders_since(self, after):
+        return list(self._all_orders)
+
+    def _record(self, order):
+        self._all_orders.append(order)
+        self._orders_by_cid[order.client_order_id] = order
+        return order
+
     def submit_limit_buy(self, symbol, notional_usd, limit_price, client_order_id):
         self.submitted_buys.append((symbol, notional_usd, limit_price, client_order_id))
-        return OrderView(
-            id="order-1", client_order_id=client_order_id, symbol=symbol, side="buy",
-            status="new", qty=notional_usd / limit_price, notional=None, filled_qty=0.0,
-            filled_avg_price=None, limit_price=limit_price, submitted_at=None,
-        )
+        return self._record(OrderView(
+            id=f"order-{len(self._all_orders) + 1}", client_order_id=client_order_id, symbol=symbol,
+            side="buy", status="new", qty=notional_usd / limit_price, notional=None, filled_qty=0.0,
+            filled_avg_price=None, limit_price=limit_price, submitted_at=datetime.now(timezone.utc),
+        ))
 
     def submit_limit_sell(self, symbol, qty, limit_price, client_order_id):
         self.submitted_sells.append((symbol, qty, limit_price, client_order_id))
-        return OrderView(
-            id="order-2", client_order_id=client_order_id, symbol=symbol, side="sell",
-            status="new", qty=qty, notional=None, filled_qty=0.0,
-            filled_avg_price=None, limit_price=limit_price, submitted_at=None,
-        )
+        return self._record(OrderView(
+            id=f"order-{len(self._all_orders) + 1}", client_order_id=client_order_id, symbol=symbol,
+            side="sell", status="new", qty=qty, notional=None, filled_qty=0.0,
+            filled_avg_price=None, limit_price=limit_price, submitted_at=datetime.now(timezone.utc),
+        ))
 
     def flatten_everything(self):
         self.flattened = True
@@ -128,6 +138,10 @@ def make_cfg(tmpdir, symbols=("SPY",), **overrides):
         tactical_universe_size=25,
         tactical_universe_lookback_days=20,
         core_allocation_pct=0.0,
+        core_pool_usd=0.0,  # core bootstrap off unless a test turns it on
+        sleeve_pool_usd=500.0,
+        sleeves_file_path=str(Path(tmpdir) / "sleeves.json"),
+        sleeve_history_file_path=str(Path(tmpdir) / "sleeve_history.jsonl"),
         core_holdings_file_path=str(Path(tmpdir) / "core_holdings.json"),
         notify_smtp_host="",
         notify_smtp_port=587,
@@ -143,19 +157,140 @@ def make_cfg(tmpdir, symbols=("SPY",), **overrides):
     return Config(**base)
 
 
+def write_sleeves(cfg, symbols_by_sleeve, pool_usd=500.0, start_prices=None):
+    """Write a sleeves.json giving each sleeve id ("sma"/"rsi"/"ml") its
+    symbols, as scripts/start_sleeve_experiment.py would."""
+    kinds = {"sma": "sma_crossover", "rsi": "rsi_reversion", "ml": "ml_classifier"}
+    write_sleeves_file(
+        cfg.sleeves_file_path,
+        started_at=datetime.now(timezone.utc) - timedelta(days=1),
+        core_pool_usd=cfg.core_pool_usd,
+        core_start_cash=0.0,
+        core_symbols=cfg.symbols,
+        sleeves={
+            sid: {"signal_kind": kinds[sid], "pool_usd": pool_usd, "symbols": list(syms),
+                  "start_prices": (start_prices or {}).get(sid, {})}
+            for sid, syms in symbols_by_sleeve.items()
+        },
+    )
+
+
+UPTREND = [float(i) for i in range(1, 21)]
+
+
 class TestEngineTick(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
 
     def test_normal_tick_with_uptrend_submits_buy(self):
         cfg = make_cfg(self.tmpdir)
+        write_sleeves(cfg, {"sma": ["AAA"]})
         fake = FakeBroker()
-        fake._closes["SPY"] = [float(i) for i in range(1, 21)]  # uptrend
+        fake._closes["AAA"] = UPTREND
         engine = Engine(cfg, broker=fake)
         engine.tick()
 
         self.assertEqual(len(fake.submitted_buys), 1)
         self.assertTrue(Path(cfg.state_file_path).exists())
+
+    def test_sleeve_order_ids_carry_the_sleeve_prefix(self):
+        cfg = make_cfg(self.tmpdir)
+        write_sleeves(cfg, {"sma": ["AAA"]})
+        fake = FakeBroker()
+        fake._closes["AAA"] = UPTREND
+        Engine(cfg, broker=fake).tick()
+
+        today = datetime.now(timezone.utc).date().isoformat()
+        self.assertEqual(fake.submitted_buys[0][3], f"pt-sma-AAA-buy-{today}")
+
+    def test_no_signal_trading_without_a_sleeves_file(self):
+        # Fail closed: no sleeves.json means no sleeve owns any symbol.
+        cfg = make_cfg(self.tmpdir)
+        fake = FakeBroker()
+        fake._closes["SPY"] = UPTREND
+        Engine(cfg, broker=fake).tick()
+
+        self.assertEqual(fake.submitted_buys, [])
+
+    def test_sleeves_never_trade_core_symbols(self):
+        # A core symbol listed in a sleeve is dropped (fail closed), so the
+        # signal can't touch the buy-and-hold core's shares.
+        cfg = make_cfg(self.tmpdir, symbols=("SPY",))
+        write_sleeves(cfg, {"sma": ["SPY", "AAA"]})
+        fake = FakeBroker()
+        fake._closes["SPY"] = UPTREND
+        fake._closes["AAA"] = UPTREND
+        engine = Engine(cfg, broker=fake)
+        engine.tick()
+
+        self.assertEqual({b[0] for b in fake.submitted_buys}, {"AAA"})
+        self.assertIn("SPY", engine.sleeves.dropped_symbols)
+
+    def test_each_sleeve_trades_only_its_own_symbols(self):
+        cfg = make_cfg(self.tmpdir, strategy_sleeves=("sma_crossover", "rsi_reversion"))
+        write_sleeves(cfg, {"sma": ["AAA"], "rsi": ["BBB"]})
+        fake = FakeBroker()
+        fake._closes["AAA"] = UPTREND
+        fake._closes["BBB"] = UPTREND  # SMA would buy this; RSI (overbought) won't
+        Engine(cfg, broker=fake).tick()
+
+        self.assertEqual([(b[0], b[3].split("-")[1]) for b in fake.submitted_buys], [("AAA", "sma")])
+
+    def test_sleeve_cannot_spend_beyond_its_own_pool(self):
+        # The fake account has $100k of buying power, but this sleeve's pool
+        # is $40: after the $10 cash buffer it can afford one $25 buy, not two.
+        cfg = make_cfg(self.tmpdir)
+        write_sleeves(cfg, {"sma": ["AAA", "BBB"]}, pool_usd=40.0)
+        fake = FakeBroker(equity=100_000.0, cash=100_000.0, buying_power=100_000.0)
+        fake._closes["AAA"] = UPTREND
+        fake._closes["BBB"] = UPTREND
+        engine = Engine(cfg, broker=fake)
+        engine.tick()
+
+        self.assertEqual(len(fake.submitted_buys), 1)
+        self.assertTrue(any("cash buffer" in e["message"] for e in engine._events))
+
+    def test_open_buy_is_reserved_out_of_the_sleeve_cash(self):
+        cfg = make_cfg(self.tmpdir)
+        write_sleeves(cfg, {"sma": ["AAA"]})
+        fake = FakeBroker()
+        fake._closes["AAA"] = UPTREND
+        engine = Engine(cfg, broker=fake)
+        engine.tick()  # submits a $25 buy that stays open
+        engine.tick()
+
+        ledger = engine._ledgers["sma"]
+        self.assertAlmostEqual(ledger.reserved_usd, 25.0, places=2)
+        self.assertAlmostEqual(ledger.cash, 475.0, places=2)
+        self.assertAlmostEqual(ledger.equity, 500.0, places=2)
+
+    def test_missing_ml_model_skips_only_the_ml_sleeve(self):
+        cfg = make_cfg(self.tmpdir, strategy_sleeves=("sma_crossover", "ml_classifier"))
+        write_sleeves(cfg, {"sma": ["AAA"], "ml": ["BBB"]})
+        fake = FakeBroker()
+        fake._closes["AAA"] = UPTREND
+        fake._closes["BBB"] = [float(i) for i in range(1, 41)]
+        engine = Engine(cfg, broker=fake)
+        engine.tick()
+        engine.tick()
+
+        self.assertEqual({b[0] for b in fake.submitted_buys}, {"AAA"})
+        self.assertFalse(engine.kill_switch.is_triggered())
+        missing = [e for e in engine._events if "no trained model" in e["message"]]
+        self.assertEqual(len(missing), 1)  # once per day, not every tick
+
+    def test_state_reports_every_sleeve(self):
+        cfg = make_cfg(self.tmpdir, strategy_sleeves=("sma_crossover", "rsi_reversion"))
+        write_sleeves(cfg, {"sma": ["AAA"], "rsi": ["BBB"]})
+        fake = FakeBroker()
+        Engine(cfg, broker=fake).tick()
+
+        state = json.loads(Path(cfg.state_file_path).read_text(encoding="utf-8"))
+        self.assertEqual(list(state["sleeves"]), ["core", "sma", "rsi"])
+        self.assertEqual(state["sleeves"]["rsi"]["symbols"], ["BBB"])
+        self.assertAlmostEqual(state["sleeves"]["sma"]["equity"], 500.0)
+        history = Path(cfg.sleeve_history_file_path).read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(history), 1)
 
     def test_kill_file_present_blocks_new_trades(self):
         cfg = make_cfg(self.tmpdir)
@@ -233,16 +368,37 @@ class TestEngineTick(unittest.TestCase):
         self.assertEqual(engine.kill_switch.mode(), KillMode.HALT)
 
     def test_daily_loss_breach_triggers_flatten(self):
+        # Breakers measure the money the sleeves manage: here one $500 pool
+        # plus a $400 position in its symbol, which then drops to $300.
         cfg = make_cfg(self.tmpdir, daily_loss_limit_pct=0.03)
-        fake = FakeBroker(equity=100.0)
+        write_sleeves(cfg, {"sma": ["AAA"]})
+        fake = FakeBroker()
+        fake._positions["AAA"] = Position(
+            symbol="AAA", qty=4.0, market_value=400.0, avg_entry_price=100.0, current_price=100.0, side="long",
+        )
         engine = Engine(cfg, broker=fake)
-        engine.tick()  # seeds day_start_equity = 100
+        engine.tick()  # seeds day_start_equity = 900
 
-        fake._equity = 90.0  # down 10%, breaches 3% daily loss limit
-        engine.tick()
+        fake._positions["AAA"] = Position(
+            symbol="AAA", qty=4.0, market_value=300.0, avg_entry_price=100.0, current_price=75.0, side="long",
+        )
+        engine.tick()  # 800 is down 11%
 
         self.assertTrue(fake.flattened)
         self.assertEqual(engine.kill_switch.mode(), KillMode.FLATTEN)
+
+    def test_breakers_ignore_account_money_outside_the_sleeves(self):
+        # A big swing in the rest of the (paper) account isn't the
+        # strategies' doing and mustn't flatten them.
+        cfg = make_cfg(self.tmpdir, daily_loss_limit_pct=0.03)
+        write_sleeves(cfg, {"sma": ["AAA"]})
+        fake = FakeBroker(equity=100_000.0)
+        engine = Engine(cfg, broker=fake)
+        engine.tick()
+        fake._equity = 80_000.0
+        engine.tick()
+
+        self.assertFalse(fake.flattened)
 
     def test_refuses_same_day_round_trip(self):
         """A sell signal must NOT be submitted if a buy already happened for
@@ -253,19 +409,20 @@ class TestEngineTick(unittest.TestCase):
         from broker import OrderView
 
         cfg = make_cfg(self.tmpdir)
+        write_sleeves(cfg, {"sma": ["AAA"]})
         fake = FakeBroker()
         # Downtrend -> sell signal, but we already hold a position (as if
         # bought earlier today) AND a buy order already exists for today.
-        fake._closes["SPY"] = [float(i) for i in range(20, 0, -1)]
+        fake._closes["AAA"] = [float(i) for i in range(120, 100, -1)]
         from broker import Position
-        fake._positions["SPY"] = Position(
-            symbol="SPY", qty=0.25, market_value=25.0, avg_entry_price=100.0,
+        fake._positions["AAA"] = Position(
+            symbol="AAA", qty=0.25, market_value=25.0, avg_entry_price=100.0,
             current_price=99.0, side="long",
         )
         today = datetime.now(_tz.utc).date()
-        buy_cid = f"pt-SPY-buy-{today.isoformat()}"
+        buy_cid = f"pt-sma-AAA-buy-{today.isoformat()}"
         fake._orders_by_cid[buy_cid] = OrderView(
-            id="o1", client_order_id=buy_cid, symbol="SPY", side="buy", status="filled",
+            id="o1", client_order_id=buy_cid, symbol="AAA", side="buy", status="filled",
             qty=0.25, notional=None, filled_qty=0.25, filled_avg_price=100.0,
             limit_price=100.0, submitted_at=None,
         )
@@ -274,12 +431,30 @@ class TestEngineTick(unittest.TestCase):
         engine.tick()
 
         self.assertEqual(fake.submitted_sells, [])
+        self.assertTrue(any("same-day round trip" in e["message"] for e in engine._events))
+
+    def test_no_rebuy_of_a_symbol_sold_off_by_the_experiment_reset_today(self):
+        cfg = make_cfg(self.tmpdir)
+        write_sleeves(cfg, {"sma": ["AAA"]})
+        fake = FakeBroker()
+        fake._closes["AAA"] = UPTREND
+        today = datetime.now(timezone.utc).date()
+        reset_cid = f"pt-reset-AAA-sell-{today.isoformat()}"
+        fake._orders_by_cid[reset_cid] = OrderView(
+            id="r1", client_order_id=reset_cid, symbol="AAA", side="sell", status="filled",
+            qty=1.0, notional=None, filled_qty=1.0, filled_avg_price=100.0,
+            limit_price=100.0, submitted_at=None,
+        )
+        Engine(cfg, broker=fake).tick()
+
+        self.assertEqual(fake.submitted_buys, [])
 
     def test_max_open_positions_caps_new_tactical_buys(self):
-        cfg = make_cfg(self.tmpdir, symbols=("AAA", "BBB", "CCC"), max_open_positions=2)
+        cfg = make_cfg(self.tmpdir, max_open_positions=2)
+        write_sleeves(cfg, {"sma": ["AAA", "BBB", "CCC"]})
         fake = FakeBroker()
-        for sym in cfg.symbols:
-            fake._closes[sym] = [float(i) for i in range(1, 21)]  # uptrend on all three
+        for sym in ("AAA", "BBB", "CCC"):
+            fake._closes[sym] = UPTREND
 
         engine = Engine(cfg, broker=fake)
         engine.tick()
@@ -295,15 +470,16 @@ class TestEngineTick(unittest.TestCase):
         # per symbol still waiting for a slot -- with a wide tactical
         # universe and a tight cap, that's most of the event log on every
         # idle tick. It must now be a single summary line per tick.
-        cfg = make_cfg(self.tmpdir, symbols=("AAA", "BBB", "CCC", "DDD"), max_open_positions=1)
+        cfg = make_cfg(self.tmpdir, max_open_positions=1)
+        write_sleeves(cfg, {"sma": ["AAA", "BBB", "CCC", "DDD"]})
         fake = FakeBroker()
-        for sym in cfg.symbols:
-            fake._closes[sym] = [float(i) for i in range(1, 21)]  # uptrend on all four
+        for sym in ("AAA", "BBB", "CCC", "DDD"):
+            fake._closes[sym] = UPTREND
 
         engine = Engine(cfg, broker=fake)
         engine.tick()
 
-        skip_events = [e for e in engine._events if "tactical cap" in e["message"]]
+        skip_events = [e for e in engine._events if "position cap" in e["message"]]
         self.assertEqual(len(skip_events), 1)
         self.assertIn("BBB", skip_events[0]["message"])
         self.assertIn("CCC", skip_events[0]["message"])
@@ -314,24 +490,26 @@ class TestEngineTick(unittest.TestCase):
         # Even the single batched line shouldn't repeat every 5 minutes if
         # the set of symbols stuck behind the cap hasn't actually changed --
         # at most one per day per distinct set (see engine._cap_skip_logged).
-        cfg = make_cfg(self.tmpdir, symbols=("AAA", "BBB", "CCC", "DDD"), max_open_positions=1)
+        cfg = make_cfg(self.tmpdir, max_open_positions=1)
+        write_sleeves(cfg, {"sma": ["AAA", "BBB", "CCC", "DDD"]})
         fake = FakeBroker()
-        for sym in cfg.symbols:
-            fake._closes[sym] = [float(i) for i in range(1, 21)]
+        for sym in ("AAA", "BBB", "CCC", "DDD"):
+            fake._closes[sym] = UPTREND
 
         engine = Engine(cfg, broker=fake)
         engine.tick()
         engine.tick()
         engine.tick()
 
-        skip_events = [e for e in engine._events if "tactical cap" in e["message"]]
+        skip_events = [e for e in engine._events if "position cap" in e["message"]]
         self.assertEqual(len(skip_events), 1)
 
     def test_cap_skip_summary_relogs_when_the_skipped_set_changes(self):
-        cfg = make_cfg(self.tmpdir, symbols=("AAA", "BBB", "CCC", "DDD"), max_open_positions=1)
+        cfg = make_cfg(self.tmpdir, max_open_positions=1)
+        write_sleeves(cfg, {"sma": ["AAA", "BBB", "CCC", "DDD"]})
         fake = FakeBroker()
-        for sym in cfg.symbols:
-            fake._closes[sym] = [float(i) for i in range(1, 21)]
+        for sym in ("AAA", "BBB", "CCC", "DDD"):
+            fake._closes[sym] = UPTREND
 
         engine = Engine(cfg, broker=fake)
         engine.tick()  # cap=1 -> skips BBB, CCC, DDD
@@ -341,7 +519,7 @@ class TestEngineTick(unittest.TestCase):
         RiskProfileStore(cfg.risk_profile_file_path).write("normal", {"max_open_positions": 2})
         engine.tick()  # cap=2 -> skips CCC, DDD only
 
-        skip_events = [e for e in engine._events if "tactical cap" in e["message"]]
+        skip_events = [e for e in engine._events if "position cap" in e["message"]]
         self.assertEqual(len(skip_events), 2)
         self.assertIn("BBB", skip_events[0]["message"])
         self.assertIn("DDD", skip_events[1]["message"])
@@ -350,7 +528,8 @@ class TestEngineTick(unittest.TestCase):
     def test_max_open_positions_does_not_block_sells_of_already_open_symbols(self):
         # The cap only ever gates opening a NEW distinct tactical symbol --
         # it must never block a sell signal on a symbol already held.
-        cfg = make_cfg(self.tmpdir, symbols=("AAA", "BBB"), max_open_positions=1)
+        cfg = make_cfg(self.tmpdir, max_open_positions=1)
+        write_sleeves(cfg, {"sma": ["AAA", "BBB"]})
         fake = FakeBroker()
         fake._positions["AAA"] = Position(
             symbol="AAA", qty=1.0, market_value=10.0, avg_entry_price=10.0,
@@ -369,33 +548,11 @@ class TestEngineTick(unittest.TestCase):
         self.assertEqual(fake.submitted_sells[0][0], "AAA")
         self.assertEqual(fake.submitted_buys, [])  # BBB blocked: AAA already occupies the 1-position cap
 
-    def test_tactical_universe_symbol_trades_in_addition_to_core_symbols(self):
-        # A symbol present ONLY in tactical_universe.json (never in
-        # cfg.symbols) must still get quotes/history/signals and be
-        # tradable -- purely additive on top of the static core whitelist.
-        cfg = make_cfg(self.tmpdir, symbols=("SPY",))
-        Path(cfg.tactical_universe_file_path).write_text(
-            json.dumps({"symbols": ["ZZZ"]}), encoding="utf-8"
-        )
-        fake = FakeBroker()
-        fake._closes["ZZZ"] = [float(i) for i in range(1, 21)]  # uptrend
-
-        engine = Engine(cfg, broker=fake)
-        engine.tick()
-
-        bought_symbols = {b[0] for b in fake.submitted_buys}
-        self.assertIn("ZZZ", bought_symbols)
-        self.assertNotIn("ZZZ", cfg.symbols)  # confirms it came from the universe file, not cfg.symbols
-
-        engine = Engine(cfg, broker=fake)
-        engine.tick()
-
-        self.assertEqual(fake.submitted_sells, [])
-
     def test_market_closed_skips_trading(self):
         cfg = make_cfg(self.tmpdir)
+        write_sleeves(cfg, {"sma": ["AAA"]})
         fake = FakeBroker(market_is_open=False)
-        fake._closes["SPY"] = [float(i) for i in range(1, 21)]
+        fake._closes["AAA"] = UPTREND
         engine = Engine(cfg, broker=fake)
         engine.tick()
 
@@ -454,9 +611,10 @@ class TestBrokerConnectivityAutoRecovery(unittest.TestCase):
 
     def test_auto_resumes_once_broker_recovers(self):
         cfg = make_cfg(self.tmpdir)
+        write_sleeves(cfg, {"sma": ["AAA"]})
         fake = FakeBroker()
         fake.fail_account_with = BrokerError("500 Internal Server Error")
-        fake._closes["SPY"] = [float(i) for i in range(1, 21)]  # uptrend, ready to buy on resume
+        fake._closes["AAA"] = UPTREND  # ready to buy on resume
         engine = Engine(cfg, broker=fake)
 
         for _ in range(cfg.max_consecutive_errors):
@@ -526,6 +684,31 @@ class TestBrokerConnectivityAutoRecovery(unittest.TestCase):
 
         self.assertTrue(engine.kill_switch.is_triggered())
         self.assertNotEqual(engine.kill_switch.reason(), BROKER_CONNECTIVITY_HALT_REASON)
+
+    def test_broker_error_logs_one_line_warning_not_a_traceback(self):
+        cfg = make_cfg(self.tmpdir)
+        fake = FakeBroker()
+        fake.fail_account_with = BrokerError("get_account failed: 500")
+        engine = Engine(cfg, broker=fake)
+        engine.tick()
+
+        broker_events = [e for e in engine._events if "broker/API error" in e["message"]]
+        self.assertEqual(len(broker_events), 1)
+        self.assertEqual(broker_events[0]["level"], "warn")
+        self.assertIn("1 of 3", broker_events[0]["message"])
+        self.assertNotIn("Traceback", broker_events[0]["message"])
+        self.assertFalse(any(e["level"] == "error" for e in engine._events))
+
+    def test_non_broker_error_still_logs_full_traceback(self):
+        cfg = make_cfg(self.tmpdir)
+        fake = FakeBroker()
+        fake.positions = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        engine = Engine(cfg, broker=fake)
+        engine.tick()
+
+        errors = [e for e in engine._events if e["level"] == "error"]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("Traceback", errors[0]["message"])
 
     def test_manual_halt_is_never_auto_cleared_even_if_broker_is_healthy(self):
         cfg = make_cfg(self.tmpdir)

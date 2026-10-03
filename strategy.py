@@ -66,7 +66,9 @@ class OrderIntent:
             raise ValueError("sell OrderIntent must set qty")
 
 
-def _client_order_id(symbol: str, side: Side, as_of: date) -> str:
+def _client_order_id(symbol: str, side: Side, as_of: date, sleeve_id: Optional[str] = None) -> str:
+    if sleeve_id:
+        return f"pt-{sleeve_id}-{symbol}-{side}-{as_of.isoformat()}"
     return f"pt-{symbol}-{side}-{as_of.isoformat()}"
 
 
@@ -88,6 +90,7 @@ def propose(
     history: Dict[str, List[float]],
     cfg,
     core_holdings: Optional[Dict[str, float]] = None,
+    sleeve_id: Optional[str] = None,
 ) -> List[OrderIntent]:
     """Produce a list of OrderIntents for every whitelisted symbol.
 
@@ -117,6 +120,11 @@ def propose(
         satellite sleeve (core.py) and therefore off-limits to this
         function. Defaults to "no core carve-out" if omitted, so existing
         callers/tests that don't use core-satellite are unaffected.
+    sleeve_id:
+        The strategy sleeve these intents belong to (see sleeves.py). It
+        goes into every client_order_id (pt-<sleeve>-<SYMBOL>-<side>-<date>)
+        so the sleeve's cash ledger can attribute the order. None keeps the
+        older un-prefixed id (used by offline tools).
     """
     del account  # not used for sizing here; kept for signature symmetry
     core_holdings = core_holdings or {}
@@ -145,7 +153,7 @@ def propose(
                     symbol=symbol,
                     side="buy",
                     limit_price=limit,
-                    client_order_id=_client_order_id(symbol, "buy", today),
+                    client_order_id=_client_order_id(symbol, "buy", today, sleeve_id),
                     reason=f"{signal.kind} buy signal",
                     notional_usd=cfg.target_trade_usd,
                 )
@@ -159,7 +167,7 @@ def propose(
                     symbol=symbol,
                     side="sell",
                     limit_price=limit,
-                    client_order_id=_client_order_id(symbol, "sell", today),
+                    client_order_id=_client_order_id(symbol, "sell", today, sleeve_id),
                     reason=f"{signal.kind} sell signal",
                     qty=tactical_qty,
                 )

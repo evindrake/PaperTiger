@@ -449,9 +449,16 @@ def main() -> None:
     parser.add_argument("--commission-usd", type=float, default=0.0)
     parser.add_argument("--warmup-days", type=int, default=None)
     parser.add_argument("--out", default="backtest_results.json")
+    parser.add_argument("--sleeve", default=None,
+                        help="backtest one strategy sleeve (e.g. 'sma') on its own symbols and signal, "
+                             "starting from its own pool -- see sleeves.json")
     args = parser.parse_args()
 
     cfg = load_config()
+    if args.sleeve:
+        from sleeves import cfg_for_sleeve
+
+        cfg = cfg_for_sleeve(cfg, args.sleeve)
     bt_cfg = BacktestConfig(
         initial_capital=cfg.seed_usd,
         slippage_bps=args.slippage_bps,

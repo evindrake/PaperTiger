@@ -1,5 +1,5 @@
 {
-  "_comment": "Static, user-editable pool of liquid US stocks eligible for the tactical/satellite sleeve -- NOT the live trading list. scripts/refresh_tactical_universe.py intersects this with what Alpaca currently reports as active+tradable US equities, ranks the survivors by recent average dollar volume, and writes the top TACTICAL_UNIVERSE_SIZE of them to tactical_universe.json (which the engine actually reads). Edit this list freely -- add/remove tickers you want considered; nothing here is ever traded directly.",
+  "_comment": "Static, user-editable pool of liquid US stocks eligible for the strategy sleeves -- NOT the live trading list. scripts/refresh_tactical_universe.py intersects this with what Alpaca currently reports as active+tradable US equities, ranks the survivors by recent average dollar volume, and writes the top TACTICAL_UNIVERSE_SIZE of them to tactical_universe.json. scripts/start_sleeve_experiment.py then deals that ranked list out to the signal sleeves using the 'sectors' map below, so every sleeve gets a similar sector mix. Edit freely -- add/remove tickers you want considered (give any new ticker a sector, or it counts as 'other'); nothing here is ever traded directly.",
   "symbols": [
     "AAPL", "MSFT", "AMZN", "GOOGL", "META", "NVDA", "TSLA", "AVGO", "ORCL", "CRM",
     "ADBE", "CSCO", "AMD", "INTC", "QCOM", "TXN", "IBM", "NOW", "INTU", "AMAT",
@@ -9,5 +9,25 @@
     "PEP", "PM", "MO", "CL", "KMB", "GIS", "XOM", "CVX", "COP", "SLB",
     "UNP", "UPS", "HON", "CAT", "DE", "BA", "GE", "LMT", "RTX", "MMM",
     "DIS", "CMCSA", "NFLX", "T", "VZ", "TMUS", "LIN", "APD", "NEE", "DUK"
-  ]
+  ],
+  "sectors": {
+    "AAPL": "tech", "MSFT": "tech", "NVDA": "tech", "AVGO": "tech", "ORCL": "tech",
+    "CRM": "tech", "ADBE": "tech", "CSCO": "tech", "AMD": "tech", "INTC": "tech",
+    "QCOM": "tech", "TXN": "tech", "IBM": "tech", "NOW": "tech", "INTU": "tech", "AMAT": "tech",
+    "GOOGL": "communication", "META": "communication", "NFLX": "communication", "DIS": "communication",
+    "CMCSA": "communication", "T": "communication", "VZ": "communication", "TMUS": "communication",
+    "AMZN": "consumer_discretionary", "TSLA": "consumer_discretionary", "HD": "consumer_discretionary",
+    "LOW": "consumer_discretionary", "MCD": "consumer_discretionary", "NKE": "consumer_discretionary",
+    "SBUX": "consumer_discretionary", "TGT": "consumer_discretionary",
+    "JPM": "financials", "BAC": "financials", "WFC": "financials", "GS": "financials", "MS": "financials",
+    "V": "financials", "MA": "financials", "AXP": "financials", "BLK": "financials", "SCHW": "financials",
+    "UNH": "healthcare", "JNJ": "healthcare", "LLY": "healthcare", "ABBV": "healthcare", "MRK": "healthcare",
+    "PFE": "healthcare", "TMO": "healthcare", "ABT": "healthcare", "DHR": "healthcare", "BMY": "healthcare",
+    "COST": "staples", "WMT": "staples", "PG": "staples", "KO": "staples", "PEP": "staples",
+    "PM": "staples", "MO": "staples", "CL": "staples", "KMB": "staples", "GIS": "staples",
+    "XOM": "energy", "CVX": "energy", "COP": "energy", "SLB": "energy",
+    "UNP": "industrials", "UPS": "industrials", "HON": "industrials", "CAT": "industrials", "DE": "industrials",
+    "BA": "industrials", "GE": "industrials", "LMT": "industrials", "RTX": "industrials", "MMM": "industrials",
+    "LIN": "materials", "APD": "materials", "NEE": "utilities", "DUK": "utilities"
+  }
 }

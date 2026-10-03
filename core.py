@@ -2,19 +2,20 @@
 core.py -- the "core" (permanent buy-and-hold) sleeve of a core-satellite split.
 
 Why this exists: backtest.py and walkforward.py have shown that the
-tactical signal (SMA crossover or RSI reversion) does not reliably beat
-plain buy-and-hold. A core-satellite split hedges against that by permanently
-setting aside a fixed fraction of capital (`cfg.core_allocation_pct`) into an
-equal-weight, buy-once-and-never-sell position across the symbol whitelist.
-That portion captures the market's long-run drift no matter what the
-tactical signal does. The remainder ("satellite") is the only capital
-strategy.py's signal is ever allowed to trade.
+tactical signals (SMA crossover, RSI reversion, ML) do not reliably beat
+plain buy-and-hold. So the core is its own strategy sleeve (see
+sleeves.py): a fixed pool (`cfg.core_pool_usd`) bought once, equal-weight,
+across the core symbol list (`cfg.symbols`), and never sold. It captures
+the market's long-run drift no matter what the signals do, and doubles as
+the baseline the signal sleeves are compared against. Signal sleeves never
+trade core symbols at all.
 
 This is a ONE-TIME, idempotent bootstrap, not an ongoing strategy:
   - On the first tick(s) after the bot starts, ensure_core_positions()
-    submits one buy per symbol sized at (core_allocation_pct * seed_usd) /
-    len(symbols), and records the FILLED quantity into core_holdings.json
-    once each order confirms filled.
+    submits one buy per symbol sized at core_pool_usd / len(symbols), and
+    records the FILLED quantity into core_holdings.json once each order
+    confirms filled. (scripts/start_sleeve_experiment.py can also top an
+    existing core position up to that size, once.)
   - After every symbol has a recorded core qty, this module is a no-op on
     every later tick -- it only ever reports how many shares are core (via
     tactical_available_qty), never buys or sells again.
@@ -65,8 +66,15 @@ class CoreAllocator:
         tmp.write_text(json.dumps(holdings, indent=2), encoding="utf-8")
         tmp.replace(self.path)
 
+    def add_to_holding(self, symbol: str, qty: float) -> None:
+        """Record extra core shares (the one-time top-up in
+        scripts/start_sleeve_experiment.py) on top of whatever is recorded."""
+        holdings = self.load()
+        holdings[symbol] = holdings.get(symbol, 0.0) + qty
+        self._save(holdings)
+
     def is_established(self) -> bool:
-        if self.cfg.core_allocation_pct <= 0:
+        if self.cfg.core_pool_usd <= 0:
             return True  # core-satellite disabled entirely -- nothing to establish
         holdings = self.load()
         return all(s in holdings for s in self.cfg.symbols)
@@ -91,15 +99,15 @@ class CoreAllocator:
         core qty, this returns immediately with no side effects.
         """
         logs: List[str] = []
-        if self.cfg.core_allocation_pct <= 0:
-            return logs  # core-satellite disabled entirely (e.g. core_allocation_pct=0)
+        if self.cfg.core_pool_usd <= 0:
+            return logs  # core sleeve disabled entirely (CORE_POOL_USD=0)
 
         holdings = self.load()
         missing = [s for s in self.cfg.symbols if s not in holdings]
         if not missing:
             return logs
 
-        target_usd_per_symbol = (self.cfg.core_allocation_pct * self.cfg.seed_usd) / len(self.cfg.symbols)
+        target_usd_per_symbol = self.cfg.core_pool_usd / len(self.cfg.symbols)
         open_by_client_id = {o.client_order_id: o for o in open_orders}
 
         for symbol in missing:

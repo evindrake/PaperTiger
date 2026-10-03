@@ -6,18 +6,26 @@ a real (paper, by default) broker connection. The loop is intentionally
 linear and boring -- read the tick() method top to bottom and it tells you
 the entire safety story:
 
-    0. Fold in the live risk profile + dynamic tactical universe (see
+    0. Fold in the live risk profile + the strategy sleeves (see
        _build_effective_cfg) -> everything below uses effective_cfg, never
-       the raw self.cfg, for anything risk/universe-related.
+       the raw self.cfg, for anything risk/symbol-related.
     1. Is the kill file present?            -> obey it, do nothing new.
     2. Pull truth from the broker.           -> broker is always authoritative.
     3. Reconcile against our own records.    -> a surprise order means HALT.
-    4. Run circuit breakers on the numbers.  -> may escalate to FLATTEN/HALT.
-    5. If the market's open, refresh history and ask strategy to propose.
-    6. Filter same-day round trips and the max_open_positions cap.
-    7. Validate every remaining proposal through PreTradeCheck.
-    8. Submit only the survivors, with an idempotency key.
+    4. Rebuild every sleeve's cash and value from the broker's order history,
+       then run circuit breakers on the total. -> may escalate to FLATTEN.
+    5. If the market's open, top up core (one-time) and, for EACH signal
+       sleeve separately (_trade_sleeve), ask strategy to propose for that
+       sleeve's own symbols only:
+    6.   filter same-day round trips and the sleeve's max_open_positions cap,
+    7.   validate every remaining proposal through PreTradeCheck against the
+         sleeve's own cash -- never the whole account's,
+    8.   submit only the survivors, with an idempotency key.
     9. Write a runtime_state.json snapshot, no matter what happened.
+
+Strategy sleeves (see sleeves.py): core buy-and-hold plus one sleeve per
+signal in STRATEGY_SLEEVES share this one account, each with its own pool
+of money and its own symbols -- no symbol ever belongs to two sleeves.
 
 Any unhandled exception anywhere in a tick is caught at the very top level
 and treated as an error tick -- feeding the consecutive-error circuit
@@ -49,9 +57,23 @@ from typing import Deque, Dict, List, Optional, Tuple
 
 import equity_history
 import notify
+import sleeve_history
 import trade_log
 from broker import Broker, BrokerError, OrderView
 from core import CoreAllocator, core_client_order_id
+from sleeves import (
+    CORE_SLEEVE_ID,
+    SLEEVE_LABELS,
+    SleeveLedger,
+    SleeveSpec,
+    compute_core_ledger,
+    compute_sleeve_ledger,
+    core_topup_client_order_id,
+    empty_sleeves,
+    load_sleeves,
+    reset_client_order_id,
+    sleeve_client_order_id,
+)
 from safety import (
     BROKER_CONNECTIVITY_HALT_REASON,
     DEFAULT_RISK_PROFILE,
@@ -111,12 +133,20 @@ class Engine:
         self._market_open_prev: Optional[bool] = None  # None until the first
         # tick observes it -- lets us log only on open<->closed transitions
         # instead of every 5-minute tick overnight/weekends.
-        self._cap_skip_logged: Optional[Tuple[date, frozenset]] = None  # the
-        # (day, symbol-set) of the last "skipping buy(s) at the tactical
-        # cap" summary we logged -- at most one per day per distinct set of
-        # skipped symbols, so a cap that's simply staying full all day
+        self._cap_skip_logged: Dict[str, Tuple[date, frozenset]] = {}  # per
+        # sleeve: the (day, symbol-set) of the last "skipping buy(s) at the
+        # position cap" summary we logged -- at most one per day per distinct
+        # set of skipped symbols, so a cap that's simply staying full all day
         # doesn't re-announce itself every 5 minutes. Logs again the moment
         # the actual set of skipped symbols changes, even same-day.
+
+        # Strategy sleeves (see sleeves.py): re-read from sleeves.json every
+        # tick in _build_effective_cfg, like the risk profile.
+        self.sleeves = empty_sleeves(cfg)
+        self._ledgers: Dict[str, SleeveLedger] = {}  # last computed, per sleeve id
+        self._ledgers_fresh = False  # computed THIS tick (vs. carried over)
+        self._managed_equity: Optional[float] = None  # sum of every sleeve's equity
+        self._once_per_day_logged: Dict[str, date] = {}  # message key -> day last logged
 
     # -- event log / state snapshot ----------------------------------------
 
@@ -130,6 +160,12 @@ class Engine:
             }
         )
 
+    def _log_once_per_day(self, key: str, level: str, message: str) -> None:
+        today = datetime.now(timezone.utc).date()
+        if self._once_per_day_logged.get(key) != today:
+            self._once_per_day_logged[key] = today
+            self._log(level, message)
+
     def _write_state(
         self,
         account=None,
@@ -142,7 +178,9 @@ class Engine:
         an error tick, so the watchdog and dashboard always see a fresh
         timestamp reflecting "the engine is alive and this is what it saw."
         """
-        equity = account.equity if account is not None else None
+        # Breaker percentages are measured on the money the strategies
+        # actually manage, not the whole account (see _tick_inner step 4).
+        equity = self._managed_equity
         if account is not None:
             equity_history.append_snapshot(
                 self.cfg.equity_history_file_path,
@@ -150,6 +188,25 @@ class Engine:
                 cash=account.cash,
                 positions_value={sym: p.market_value for sym, p in (positions or {}).items()},
             )
+        if account is not None and self._ledgers_fresh and self._ledgers:
+            sleeve_history.record_today(
+                self.cfg.sleeve_history_file_path,
+                {
+                    sid: {
+                        "equity": round(led.equity, 2),
+                        "cash": round(led.cash + led.reserved_usd, 2),
+                        "benchmark": round(led.benchmark_equity, 2) if led.benchmark_equity is not None else None,
+                    }
+                    for sid, led in self._ledgers.items()
+                },
+            )
+        sleeve_symbols = {CORE_SLEEVE_ID: list(self.cfg.symbols)}
+        sleeve_symbols.update({spec.sleeve_id: list(spec.symbols) for spec in self.sleeves.sleeves})
+        sleeves_state = {}
+        for sid, ledger in self._ledgers.items():
+            entry = ledger.to_dict()
+            entry["symbols"] = sleeve_symbols.get(sid, [])
+            sleeves_state[sid] = entry
         state = {
             "written_at": datetime.now(timezone.utc).isoformat(),
             "halted": self._halted,
@@ -158,18 +215,30 @@ class Engine:
             "positions": {sym: asdict(p) for sym, p in (positions or {}).items()},
             "open_orders": [asdict(o) for o in (open_orders or [])],
             "core_holdings": core_holdings or self.core.load(),
-            "core_allocation_pct": self.cfg.core_allocation_pct,
+            "managed_equity": round(equity, 2) if equity is not None else None,
             "daily_pl_pct": self.circuit_breakers.daily_pl_pct(equity) if equity is not None else None,
             "drawdown_pct": self.circuit_breakers.drawdown_pct(equity) if equity is not None else None,
             "circuit_breakers": self.circuit_breakers.to_dict(),
+            # One entry per strategy sleeve (core first), each with its own
+            # cash, value, buy-and-hold benchmark and trade stats -- what the
+            # dashboard's Compare tab renders. See sleeves.py.
+            "sleeves": sleeves_state,
+            "experiment": {
+                "started_at": self.sleeves.started_at.isoformat() if self.sleeves.started_at else None,
+                "frozen": self.sleeves.frozen,
+                "dropped_symbols": list(self.sleeves.dropped_symbols),
+            },
             "events": list(self._events),
             # A read-only snapshot of the operationally-relevant config, for
             # the dashboard's Status tab -- no credentials, just what's
             # actually running right now (loop cadence, signal params, caps).
             "config_snapshot": {
-                "symbols": list(self.cfg.symbols),  # static core whitelist -- see core.py
-                "tactical_universe": [s for s in self.effective_cfg.symbols if s not in self.cfg.symbols],
-                "signal_kind": self.cfg.signal_kind,
+                "symbols": list(self.cfg.symbols),  # core sleeve's symbols -- see core.py
+                "sleeve_symbols": sleeve_symbols,
+                "strategy_sleeves": list(self.cfg.sleeve_kinds()),
+                "core_pool_usd": self.sleeves.core_pool_usd,
+                "sleeve_pool_usd": self.cfg.sleeve_pool_usd,
+                "alpaca_paper": self.cfg.alpaca_paper,
                 "signal_fast": self.cfg.signal_fast,
                 "signal_slow": self.cfg.signal_slow,
                 "signal_period": self.cfg.signal_period,
@@ -216,16 +285,18 @@ class Engine:
         return True
 
     def _known_client_order_ids(self, extra_symbols: Tuple[str, ...] = ()) -> set:
-        """All client_order_ids we could plausibly have generated: today's
-        and yesterday's, for every currently-whitelisted symbol and side
-        (core + current tactical universe, plus `extra_symbols` -- pass the
-        broker's currently-held position symbols here so a symbol that
-        rolled OUT of the tactical universe between refreshes but still has
-        an open order/position isn't mistaken for a stranger), PLUS the
-        one-time core-satellite bootstrap ids (see core.py, always tied to
-        the static core list only). Yesterday is included so a tactical
-        order submitted just before midnight UTC and still open the next
-        tick isn't mistaken for a stranger either."""
+        """All client_order_ids we could plausibly have generated, for today
+        and yesterday (so an order placed just before midnight UTC and still
+        open the next tick isn't mistaken for a stranger):
+          - each sleeve's own ids for its own symbols (pt-<sleeve>-...),
+          - the one-time core ids (bootstrap buys, see core.py, and the
+            top-ups / "sell everything" orders from
+            scripts/start_sleeve_experiment.py),
+          - the older un-prefixed pt-<SYMBOL>-<side>-<date> ids, so orders
+            from before sleeves existed don't trip reconcile on the
+            switch-over day.
+        `extra_symbols` should be the broker's currently-held symbols, so a
+        position outside every current list still isn't a stranger."""
         from datetime import timedelta
 
         today = datetime.now(timezone.utc).date()
@@ -236,6 +307,13 @@ class Engine:
             for symbol in all_symbols:
                 for side in ("buy", "sell"):
                     ids.add(f"pt-{symbol}-{side}-{d.isoformat()}")
+                ids.add(reset_client_order_id(symbol, d))
+            for spec in self.sleeves.sleeves:
+                for symbol in spec.symbols:
+                    for side in ("buy", "sell"):
+                        ids.add(sleeve_client_order_id(spec.sleeve_id, symbol, side, d))
+            for symbol in self.cfg.symbols:
+                ids.add(core_topup_client_order_id(symbol, d))
         for symbol in self.cfg.symbols:
             ids.add(core_client_order_id(symbol))
         return ids
@@ -256,50 +334,43 @@ class Engine:
         self._history_cache_date = today
         self._log("info", f"refreshed daily history cache for {list(fresh.keys())}")
 
-    # -- live risk profile + dynamic tactical universe -------------------------
+    # -- live risk profile + strategy sleeves ---------------------------------
 
     def _build_effective_cfg(self):
         """Fold the live-reloadable risk profile (safety.RiskProfileStore)
-        and the current dynamic tactical universe on top of the static,
-        frozen self.cfg loaded at startup. Re-derived fresh every tick --
-        neither source is cached, mirroring the kill switch's own "read the
-        file every tick" posture, and both fail closed to "no change from
-        self.cfg" on anything missing or malformed.
+        and the strategy sleeves' symbols (sleeves.json, see sleeves.py) on
+        top of the static, frozen self.cfg loaded at startup. Re-derived
+        fresh every tick -- neither source is cached, mirroring the kill
+        switch's own "read the file every tick" posture, and both fail
+        closed on anything missing or malformed (no profile override; no
+        sleeve symbols, so no signal trading).
+
+        effective_cfg.symbols is core + every sleeve's symbols: the full set
+        the engine fetches history and quotes for and recognizes orders
+        for. Each sleeve still trades only its own symbols -- see
+        _trade_sleeve, which narrows this per sleeve.
 
         self.cfg itself is never mutated (still frozen, still the single
         source of truth for locked fields); this always returns a NEW
         Config via dataclasses.replace(). core.py's CoreAllocator is
         deliberately constructed with -- and stays pinned to -- self.cfg
-        directly, never this, so core bootstrap sizing (tied to
-        len(cfg.symbols)) can never be affected by a profile switch or a
-        tactical universe refresh.
+        directly, never this, so core sizing can never be affected by a
+        profile switch or the sleeves file.
         """
         profile_state = self.risk_profile_store.load()
         # Display-only fallback -- resolve() below correctly applies NOTHING
         # when profile_state.profile is None, so effective_cfg still reflects
         # self.cfg's own .env-configured values, not this cosmetic default.
         self._current_risk_profile_name = profile_state.profile or DEFAULT_RISK_PROFILE
-        tactical_extra = self._load_tactical_universe()
-        effective_symbols = tuple(dict.fromkeys(list(self.cfg.symbols) + list(tactical_extra)))
+        self.sleeves = load_sleeves(self.cfg)
+        if self.sleeves.dropped_symbols:
+            self._log_once_per_day(
+                "dropped-symbols", "warn",
+                f"sleeves.json lists {', '.join(self.sleeves.dropped_symbols)} in more than one sleeve "
+                f"or in core -- no sleeve will trade those until it's fixed",
+            )
+        effective_symbols = tuple(dict.fromkeys(list(self.cfg.symbols) + list(self.sleeves.all_symbols)))
         return replace(self.cfg, symbols=effective_symbols, **profile_state.resolve())
-
-    def _load_tactical_universe(self) -> Tuple[str, ...]:
-        """The current weekly-refreshed satellite pool (see
-        scripts/refresh_tactical_universe.py), read fresh every tick. A
-        missing or malformed file just means zero extra tactical symbols --
-        this is purely additive on top of the static core self.cfg.symbols,
-        never a replacement for it, so failing closed here costs nothing
-        but upside (one tick without the newest satellite names)."""
-        try:
-            raw = json.loads(Path(self.cfg.tactical_universe_file_path).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, ValueError):
-            return ()
-        if not isinstance(raw, dict):
-            return ()
-        symbols = raw.get("symbols")
-        if not isinstance(symbols, list):
-            return ()
-        return tuple(s.strip().upper() for s in symbols if isinstance(s, str) and s.strip())
 
     # -- main tick --------------------------------------------------------------
 
@@ -317,12 +388,23 @@ class Engine:
             # what a human (or a future automated log-scanner) actually
             # sees if _write_state() itself is what's broken.
             print(f"[engine] unhandled exception in tick:\n{tb}", file=sys.stderr, flush=True)
-            self._log("error", f"unhandled exception in tick: {tb}")
             if isinstance(exc, BrokerError):
                 self._consecutive_broker_errors += 1
             else:
                 self._consecutive_broker_errors = 0
             action = self.circuit_breakers.record_error()
+            # A broker/API failure is an expected, external kind of error --
+            # one line in the event log is enough (the full traceback is
+            # still in the stderr log above). Anything else is a potential
+            # bug in our own code, so it keeps the full traceback.
+            if isinstance(exc, BrokerError):
+                self._log(
+                    "warn",
+                    f"broker/API error ({self.circuit_breakers.state.consecutive_errors} of "
+                    f"{self.cfg.max_consecutive_errors} before HALT): {exc}",
+                )
+            else:
+                self._log("error", f"unhandled exception in tick: {tb}")
             if action == BreakerAction.HALT:
                 # Only tag this as auto-recoverable if EVERY error in the
                 # streak was a BrokerError -- a single non-broker exception
@@ -354,6 +436,7 @@ class Engine:
         # "engine halted -- sleeping" in the log forever even after trading
         # resumed normally, since nothing else in this method resets it.
         self._halted = False
+        self._ledgers_fresh = False
 
         # 0. Fold the live risk profile + dynamic tactical universe on top
         #    of the static self.cfg (see _build_effective_cfg). Done before
@@ -425,8 +508,14 @@ class Engine:
             # immediately, rather than waiting for the next scheduled tick.
 
         # 2. Pull truth from the broker. The broker's view always wins over
-        #    any local assumption about what should be true.
+        #    any local assumption about what should be true. The order
+        #    history (every sleeve's cash is rebuilt from it) is fetched
+        #    BEFORE positions on purpose: if an order fills in between, it
+        #    shows as still-open (its cost reserved) AND as a position, so a
+        #    sleeve's value briefly reads high rather than low -- and a
+        #    phantom dip is the one that could falsely trip a breaker.
         account = self.broker.account()
+        orders = self.broker.orders_since(self.sleeves.started_at) if self.sleeves.started_at else []
         positions = self.broker.positions()
         open_orders = self.broker.open_orders()
 
@@ -445,28 +534,40 @@ class Engine:
             self._write_state(account, positions, open_orders, kill_mode=KillMode.HALT)
             return
 
-        # 4. Circuit breakers, evaluated on the broker's own equity number.
+        # 4. Every sleeve's cash and value, rebuilt from the broker's own
+        #    order history (see sleeves.py), then the circuit breakers --
+        #    measured on the money the strategies actually manage (the sum
+        #    of every sleeve), not the whole account. In a paper account
+        #    holding ~$100k, a 3% daily-loss limit on the account would be
+        #    $3,000 -- more than the strategies even have -- so it could
+        #    never trip.
         today = datetime.now(timezone.utc).date()
-        breaker_action = self.circuit_breakers.check_equity(account.equity, today)
+        self._refresh_history_if_needed()
+        core_holdings = self.core.load()
+        self._update_ledgers(orders, positions, core_holdings, quotes={})
+        managed = self._managed_equity
+        breaker_action = self.circuit_breakers.check_equity(managed, today)
         if breaker_action == BreakerAction.FLATTEN:
             self._log(
                 "warn",
-                f"circuit breaker tripped FLATTEN (daily P/L {self.circuit_breakers.daily_pl_pct(account.equity):.2%}, "
-                f"drawdown {self.circuit_breakers.drawdown_pct(account.equity):.2%})",
+                f"circuit breaker tripped FLATTEN on strategy-managed equity ${managed:,.2f} "
+                f"(daily P/L {self.circuit_breakers.daily_pl_pct(managed):.2%}, "
+                f"drawdown {self.circuit_breakers.drawdown_pct(managed):.2%})",
             )
             self.kill_switch.trigger(KillMode.FLATTEN, "circuit breaker: daily loss or drawdown limit breached")
             self._halted = True
             notify.send_notification(
                 self.cfg, "Engine FLATTENED: circuit breaker tripped",
-                f"Daily P/L {self.circuit_breakers.daily_pl_pct(account.equity):.2%}, "
-                f"drawdown {self.circuit_breakers.drawdown_pct(account.equity):.2%} -- "
+                f"Strategy-managed equity ${managed:,.2f}: daily P/L "
+                f"{self.circuit_breakers.daily_pl_pct(managed):.2%}, "
+                f"drawdown {self.circuit_breakers.drawdown_pct(managed):.2%} -- "
                 f"liquidating everything to cash.",
             )
             try:
                 self.broker.flatten_everything()
             except BrokerError as e:
                 self._log("error", f"flatten_everything failed: {e}")
-            self._write_state(account, positions, open_orders, kill_mode=KillMode.FLATTEN)
+            self._write_state(account, positions, open_orders, kill_mode=KillMode.FLATTEN, core_holdings=core_holdings)
             return
 
         # 5. Only look for new trades while the market is open. Log only on
@@ -478,13 +579,11 @@ class Engine:
             if self._market_open_prev is not False:
                 self._log("info", "market closed -- no new entries until it reopens")
             self._market_open_prev = False
-            self._write_state(account, positions, open_orders)
+            self._write_state(account, positions, open_orders, core_holdings=core_holdings)
             return
         if self._market_open_prev is not True:
             self._log("info", "market reopened")
         self._market_open_prev = True
-
-        self._refresh_history_if_needed()
 
         quotes = {}
         for symbol in self.effective_cfg.symbols:
@@ -493,67 +592,120 @@ class Engine:
             except BrokerError as e:
                 self._log("warn", f"quote fetch failed for {symbol}: {e}")
 
-        # 5b. One-time core-satellite bootstrap (see core.py). A no-op on
-        # every tick after every symbol's core position is established.
+        # 5b. One-time core bootstrap (see core.py). A no-op on every tick
+        # after every core symbol's position is established.
         for line in self.core.ensure_core_positions(self.broker, account, quotes, open_orders):
             self._log("info", line)
         core_holdings = self.core.load()
+        self._update_ledgers(orders, positions, core_holdings, quotes)
 
+        # 6-8. Each signal sleeve proposes, filters, validates and submits
+        # for its own symbols only, against its own cash.
+        for spec in self.sleeves.sleeves:
+            self._trade_sleeve(spec, self._ledgers[spec.sleeve_id], account, positions, quotes, open_orders, today)
+
+        self._write_state(account, positions, open_orders, core_holdings=core_holdings)
+
+    def _update_ledgers(self, orders, positions, core_holdings, quotes) -> None:
+        """Recompute every sleeve's ledger and the managed-equity total.
+        Prices for the buy-and-hold benchmarks: last cached daily close,
+        overridden by a live quote, overridden by the broker's own position
+        price -- freshest wins."""
+        prices: Dict[str, float] = {s: closes[-1] for s, closes in self._history_cache.items() if closes}
+        prices.update({s: q.mid for s, q in quotes.items()})
+        prices.update({s: p.current_price for s, p in positions.items() if p.current_price})
+        ledgers = {
+            CORE_SLEEVE_ID: compute_core_ledger(
+                self.cfg.symbols, self.sleeves.core_pool_usd, self.sleeves.core_start_cash, positions, core_holdings,
+            )
+        }
+        for spec in self.sleeves.sleeves:
+            ledgers[spec.sleeve_id] = compute_sleeve_ledger(spec, orders, positions, prices)
+        self._ledgers = ledgers
+        self._ledgers_fresh = True
+        self._managed_equity = sum(led.equity for led in ledgers.values())
+
+    def _trade_sleeve(self, spec: SleeveSpec, ledger: SleeveLedger, account, positions, quotes, open_orders, today) -> None:
+        """Run one signal sleeve: the unchanged strategy.propose() and
+        safety.PreTradeCheck, but handed a view of the account scoped to
+        this sleeve -- its own symbols, its own cash as buying power, its
+        own value as equity -- so the buying-power check, the position and
+        concentration caps, and the whitelist all apply per sleeve. A
+        sleeve can never spend another sleeve's money, however much the
+        real account holds."""
+        if not spec.symbols:
+            return
+        label = SLEEVE_LABELS.get(spec.sleeve_id, spec.sleeve_id)
+        s_cfg = replace(self.effective_cfg, symbols=spec.symbols, signal_kind=spec.signal_kind)
+        if spec.signal_kind == "ml_classifier" and not Path(s_cfg.signal_model_path).exists():
+            # Without this, the missing model would raise inside propose()
+            # and HALT every sleeve via the consecutive-error breaker.
+            self._log_once_per_day(
+                f"ml-model-missing-{spec.sleeve_id}", "warn",
+                f"[{spec.sleeve_id}] {label}: no trained model at {s_cfg.signal_model_path} -- this sleeve "
+                f"sits out until one exists (python train_ml_signal.py --sleeve {spec.sleeve_id})",
+            )
+            return
+
+        budget = max(0.0, min(ledger.cash, account.buying_power))
+        s_account = replace(account, cash=budget, buying_power=budget, equity=ledger.equity)
+        s_positions = {s: p for s, p in positions.items() if s in spec.symbols}
         history = {}
-        for symbol in self.effective_cfg.symbols:
+        for symbol in spec.symbols:
             cached = self._history_cache.get(symbol)
             quote = quotes.get(symbol)
             if cached is not None and quote is not None:
                 history[symbol] = cached + [quote.mid]
 
-        intents: List[OrderIntent] = propose(account, positions, quotes, history, self.effective_cfg, core_holdings)
+        intents: List[OrderIntent] = propose(
+            s_account, s_positions, quotes, history, s_cfg, core_holdings={}, sleeve_id=spec.sleeve_id,
+        )
 
-        # 6 & 7. Validate then submit survivors, one at a time, with an
+        # Validate then submit survivors, one at a time, with an
         # idempotency key. On any doubt about whether a submit "actually
         # happened," look it up by client_order_id instead of guessing.
-        today = datetime.now(timezone.utc).date()
-        open_tactical_symbols = {
-            sym for sym, pos in positions.items()
-            if self.core.tactical_available_qty(sym, pos.qty) > 1e-9
-        }
+        open_symbols = {s for s, p in s_positions.items() if p.qty > 1e-9}
         approved_this_tick: set = set()
         cap_skipped_symbols: List[str] = []  # batched into one summary line
-        # below instead of one log line per symbol -- with a full tactical
-        # universe and a tight cap, every idle tick could otherwise log one
-        # line per candidate still waiting for a slot, every 5 minutes,
-        # crowding out everything else in the event ring buffer.
-        for intent in intents:
-            if self._is_same_day_round_trip(intent.symbol, intent.side, today):
-                self._log(
-                    "info",
-                    f"skipping {intent.side} for {intent.symbol}: the opposite side already "
-                    f"traded today -- refusing a same-day round trip",
-                )
-                continue
-            if intent.side == "buy" and self._would_exceed_open_positions(
-                intent.symbol, open_tactical_symbols, approved_this_tick, self.effective_cfg.max_open_positions
-            ):
-                cap_skipped_symbols.append(intent.symbol)
-                continue
-            result = self.pre_trade.validate(intent, account, positions, quotes, open_orders, core_holdings)
-            if not result.ok:
-                self._log("info", f"rejected intent for {intent.symbol} ({intent.side}): {result.reason}")
-                continue
-            if intent.side == "buy":
-                approved_this_tick.add(intent.symbol)
-            self._submit_intent(intent)
+        # below instead of one log line per symbol, and throttled to once per
+        # day per distinct set (see self._cap_skip_logged).
+        self.pre_trade.cfg = s_cfg
+        try:
+            for intent in intents:
+                if self._is_same_day_round_trip(intent.symbol, intent.side, today, spec.sleeve_id):
+                    self._log(
+                        "info",
+                        f"[{spec.sleeve_id}] skipping {intent.side} for {intent.symbol}: the opposite side "
+                        f"already traded today -- refusing a same-day round trip",
+                    )
+                    continue
+                if intent.side == "buy" and self._would_exceed_open_positions(
+                    intent.symbol, open_symbols, approved_this_tick, s_cfg.max_open_positions
+                ):
+                    cap_skipped_symbols.append(intent.symbol)
+                    continue
+                result = self.pre_trade.validate(intent, s_account, s_positions, quotes, open_orders, {})
+                if not result.ok:
+                    self._log("info", f"[{spec.sleeve_id}] rejected intent for {intent.symbol} ({intent.side}): {result.reason}")
+                    continue
+                if intent.side == "buy":
+                    approved_this_tick.add(intent.symbol)
+                    # Later buys this same tick must see the money as spent.
+                    remaining = s_account.buying_power - intent.notional_usd
+                    s_account = replace(s_account, cash=remaining, buying_power=remaining)
+                self._submit_intent(intent, spec.sleeve_id)
+        finally:
+            self.pre_trade.cfg = self.effective_cfg
 
         if cap_skipped_symbols:
             cap_skip_key = (today, frozenset(cap_skipped_symbols))
-            if cap_skip_key != self._cap_skip_logged:
-                self._cap_skip_logged = cap_skip_key
+            if cap_skip_key != self._cap_skip_logged.get(spec.sleeve_id):
+                self._cap_skip_logged[spec.sleeve_id] = cap_skip_key
                 self._log(
                     "info",
-                    f"skipping {len(cap_skipped_symbols)} buy(s) at the {self.effective_cfg.max_open_positions}-position "
-                    f"tactical cap (already full): {', '.join(cap_skipped_symbols)}",
+                    f"[{spec.sleeve_id}] skipping {len(cap_skipped_symbols)} buy(s) at the "
+                    f"{s_cfg.max_open_positions}-position cap (already full): {', '.join(cap_skipped_symbols)}",
                 )
-
-        self._write_state(account, positions, open_orders, core_holdings=core_holdings)
 
     def _would_exceed_open_positions(
         self, symbol: str, open_tactical_symbols: set, approved_this_tick: set, cap: int
@@ -567,7 +719,7 @@ class Engine:
             return False
         return len(open_tactical_symbols | approved_this_tick) >= cap
 
-    def _is_same_day_round_trip(self, symbol: str, side: str, today) -> bool:
+    def _is_same_day_round_trip(self, symbol: str, side: str, today, sleeve_id: str) -> bool:
         """True if the OPPOSITE side already has an order today for this
         symbol -- i.e. placing `intent` would open-and-close (or
         close-and-reopen) a position in the same symbol on the same
@@ -587,12 +739,19 @@ class Engine:
         check refuses that outright: at most one tactical action per
         symbol per day, which structurally rules out a same-day round
         trip regardless of how often the loop ticks.
+
+        Symbols belong to exactly one sleeve, so checking that sleeve's own
+        ids is enough. A buy also checks the one-time "sell everything"
+        order from scripts/start_sleeve_experiment.py, so a symbol sold off
+        on the experiment's first day isn't bought straight back that day.
         """
         opposite_side = "sell" if side == "buy" else "buy"
-        opposite_client_id = f"pt-{symbol}-{opposite_side}-{today.isoformat()}"
-        return self.broker.order_by_client_id(opposite_client_id) is not None
+        candidates = [sleeve_client_order_id(sleeve_id, symbol, opposite_side, today)]
+        if side == "buy":
+            candidates.append(reset_client_order_id(symbol, today))
+        return any(self.broker.order_by_client_id(cid) is not None for cid in candidates)
 
-    def _submit_intent(self, intent: OrderIntent) -> None:
+    def _submit_intent(self, intent: OrderIntent, sleeve_id: str) -> None:
         # Ambiguity handling: if we're not sure a previous submit went
         # through (e.g. this exact intent was already tried today), check
         # for an existing order under the same client_order_id FIRST rather
@@ -617,12 +776,12 @@ class Engine:
                 )
             self._log(
                 "info",
-                f"submitted {intent.side} for {intent.symbol}: {intent.reason}",
+                f"[{sleeve_id}] submitted {intent.side} for {intent.symbol}: {intent.reason}",
                 order_id=order.id,
                 client_order_id=order.client_order_id,
             )
             trade_log.append_trade(
-                self.cfg.trade_log_file_path, source="tactical", symbol=intent.symbol, side=intent.side,
+                self.cfg.trade_log_file_path, source=sleeve_id, symbol=intent.symbol, side=intent.side,
                 reason=intent.reason, qty=intent.qty, notional_usd=intent.notional_usd,
                 limit_price=intent.limit_price, order_id=order.id, client_order_id=order.client_order_id,
             )

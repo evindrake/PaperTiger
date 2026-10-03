@@ -50,8 +50,15 @@ echo "Running backtest.py ($START to $TODAY)..."
 echo "Running walkforward.py ($START to $TODAY)..."
 "$VENV_PYTHON" walkforward.py --source alpaca --start "$START" --end "$TODAY" --out walkforward_results.json 2>&1 | tee -a "$LOG_FILE"
 
-echo "Running train_ml_signal.py ($START to $TODAY)..."
-"$VENV_PYTHON" train_ml_signal.py --source alpaca --start "$START" --end "$TODAY" --model-out ml_model.joblib 2>&1 | tee -a "$LOG_FILE"
+# Once a strategy-sleeve experiment is running (sleeves.json exists), the
+# model the live ML sleeve uses is trained on that sleeve's own symbols --
+# the engine picks up the new ml_model.joblib on its next tick, no restart.
+TRAIN_ARGS=(train_ml_signal.py --source alpaca --start "$START" --end "$TODAY" --model-out ml_model.joblib)
+if [ -f "$PROJECT_DIR/sleeves.json" ]; then
+    TRAIN_ARGS+=(--sleeve ml)
+fi
+echo "Running ${TRAIN_ARGS[*]}..."
+"$VENV_PYTHON" "${TRAIN_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
 
 {
     echo "=== done: $(date -Is 2>/dev/null || date) ==="

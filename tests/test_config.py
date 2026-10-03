@@ -99,5 +99,47 @@ class TestGuardLive(unittest.TestCase):
             cfg.target_trade_usd = 999.0
 
 
+class TestMultiStrategyLiveGuard(unittest.TestCase):
+    """Several sleeves side by side is a paper-money experiment; live, it
+    needs its own explicit opt-in on top of the real-money ack."""
+
+    THREE = ("sma_crossover", "rsi_reversion", "ml_classifier")
+
+    def setUp(self):
+        import os
+        self.env = os.environ
+        self.saved = {k: self.env.get(k) for k in ("I_UNDERSTAND_THIS_IS_REAL_MONEY", "ALLOW_MULTI_STRATEGY_LIVE")}
+        self.env["I_UNDERSTAND_THIS_IS_REAL_MONEY"] = "yes"
+        self.env.pop("ALLOW_MULTI_STRATEGY_LIVE", None)
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            if v is None:
+                self.env.pop(k, None)
+            else:
+                self.env[k] = v
+
+    def test_paper_allows_several_sleeves(self):
+        make_cfg(alpaca_paper=True, strategy_sleeves=self.THREE).guard_live()
+
+    def test_live_refuses_several_sleeves_without_override(self):
+        cfg = make_cfg(alpaca_paper=False, strategy_sleeves=self.THREE)
+        with self.assertRaises(RuntimeError) as ctx:
+            cfg.guard_live()
+        self.assertIn("ALLOW_MULTI_STRATEGY_LIVE", str(ctx.exception))
+
+    def test_live_allows_several_sleeves_with_explicit_override(self):
+        self.env["ALLOW_MULTI_STRATEGY_LIVE"] = "yes"
+        make_cfg(alpaca_paper=False, strategy_sleeves=self.THREE).guard_live()
+
+    def test_live_allows_a_single_sleeve(self):
+        make_cfg(alpaca_paper=False, strategy_sleeves=("rsi_reversion",)).guard_live()
+        make_cfg(alpaca_paper=False).guard_live()  # empty -> just SIGNAL_KIND
+
+    def test_sleeve_kinds_defaults_to_signal_kind(self):
+        self.assertEqual(make_cfg(signal_kind="rsi_reversion").sleeve_kinds(), ("rsi_reversion",))
+        self.assertEqual(make_cfg(strategy_sleeves=self.THREE).sleeve_kinds(), self.THREE)
+
+
 if __name__ == "__main__":
     unittest.main()
