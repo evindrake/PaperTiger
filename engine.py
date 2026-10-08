@@ -279,6 +279,8 @@ class Engine:
                 "signal_period": self.cfg.signal_period,
                 "signal_oversold": self.cfg.signal_oversold,
                 "signal_overbought": self.cfg.signal_overbought,
+                "signal_ml_buy_threshold": self.cfg.signal_ml_buy_threshold,
+                "signal_ml_sell_threshold": self.cfg.signal_ml_sell_threshold,
                 "trade_size_pct": self.effective_cfg.trade_size_pct,
                 "max_position_pct": self.effective_cfg.max_position_pct,
                 "cash_buffer_pct": self.effective_cfg.cash_buffer_pct,

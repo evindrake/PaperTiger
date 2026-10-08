@@ -1226,7 +1226,86 @@ def _render_config_tab(state) -> str:
     '''
 
 
-def _render_about_tab() -> str:
+def _render_strategy_guide(state) -> str:
+    """Plain-language explanation of each strategy, with the settings and
+    stocks it's actually running with right now (from the engine's last
+    snapshot; falls back to the usual defaults before the engine has run)."""
+    snap = (state or {}).get("config_snapshot") or {}
+    owned = snap.get("sleeve_symbols") or {}
+    fast, slow = snap.get("signal_fast", 10), snap.get("signal_slow", 30)
+    period = snap.get("signal_period", 14)
+    oversold, overbought = snap.get("signal_oversold", 30), snap.get("signal_overbought", 70)
+    ml_buy, ml_sell = snap.get("signal_ml_buy_threshold", 0.55), snap.get("signal_ml_sell_threshold", 0.45)
+
+    def stocks(sid):
+        syms = owned.get(sid) or []
+        return _escape(", ".join(syms)) if syms else "none yet (assigned when a comparison starts)"
+
+    def card(sid, title, kind, idea, rules, good, bad, extra=""):
+        return f'''
+          <div class="strategy-card" style="border-left-color:{SLEEVE_COLORS.get(sid, "#4b5563")}">
+            <h3>{title} <span class="strategy-kind">{kind}</span></h3>
+            <p>{idea}</p>
+            <p><strong>When it buys and sells:</strong> {rules}</p>
+            <p><strong>Tends to do well:</strong> {good}<br><strong>Tends to struggle:</strong> {bad}</p>
+            {extra}
+            <p class="strategy-stocks"><strong>Its stocks:</strong> {stocks(sid)}</p>
+          </div>
+        '''
+
+    return f'''
+      <h2>The Strategies</h2>
+      <div class="hint" style="max-width: 100%;">
+        Four strategies run side by side, each with its own pool of money and its own stocks (results on the
+        Compare tab). The three signal strategies all follow the same rules for sizing and safety (the risk profile
+        on the Config tab): each buy is a fixed share of the strategy's pool, a strategy never adds to a stock it
+        already holds, a sell always sells the whole position, and it takes at most one action per stock per day
+        (no same-day round trips). They all look at <em>daily</em> closing prices plus the current price, so they
+        are slow-moving by design -- not day trading.
+      </div>
+      {card("core", "Buy &amp; hold (core)", "the baseline",
+            "Buy a fixed basket once and never sell. The basket is SPY, QQQ, VTI and IVV (funds that track the "
+            "broad US stock market), BND (a bond fund) and GLD (gold) -- a deliberately boring, diversified mix.",
+            "it buys an equal dollar amount of each fund once, at the start, and never sells.",
+            "over the long run, when markets rise -- which historically they mostly have. It's always fully "
+            "invested and never pays to trade, which makes it surprisingly hard to beat.",
+            "in a downturn it falls right along with the market; there's no attempt to step aside.",
+            "<p>It's the yardstick: a signal is only adding something if it beats simply holding.</p>")}
+      {card("sma", "SMA crossover", "trend-following",
+            f"\"Follow the trend.\" It compares the average closing price over the last {fast:g} trading days "
+            f"(the short-term trend) with the average over the last {slow:g} days (the longer-term trend).",
+            f"it buys when the {fast:g}-day average is above the {slow:g}-day average -- recent prices running "
+            f"higher than usual, an uptrend -- and sells when it drops back below.",
+            "in long, steady trends: it can ride most of a big move.",
+            "in choppy, sideways markets it gets whipsawed -- buying just after a rise, selling just after a dip. "
+            "Averages also lag, so it's always a little late. On daily prices it can go weeks without a signal.")}
+      {card("rsi", "RSI reversion", "mean-reversion",
+            "\"Buy the dip, sell the rally\" -- the opposite bet to SMA: it assumes stretched moves tend to snap "
+            f"back. The RSI (Relative Strength Index) is a 0-100 score of how one-sided the last {period:g} days "
+            "of price moves have been: near 0 means mostly falling, near 100 mostly rising.",
+            f"it buys when the RSI is {oversold:g} or below (the stock has fallen hard, \"oversold\") and sells "
+            f"when it's {overbought:g} or above (risen hard, \"overbought\").",
+            "in choppy, range-bound markets where prices swing back and forth.",
+            "in strong trends: it sells winners too early, and can keep buying a stock that just keeps falling "
+            "(\"catching a falling knife\").")}
+      {card("ml", "ML classifier", "experimental machine learning",
+            "Let a statistical model look for patterns in history. For each stock it measures nine things about "
+            "recent price action -- returns over the last 1, 5, 10 and 20 days, how volatile the last 10 and 20 "
+            "days were, the RSI, and how far the price is from its 10- and 30-day averages -- and a logistic "
+            "regression model turns those into a probability that the price will be higher 5 trading days from now.",
+            f"it buys when that probability is {ml_buy * 100:.0f}% or higher and sells when it's {ml_sell * 100:.0f}% "
+            "or lower; in between it does nothing. The model is retrained every night on its own stocks' last "
+            "4 years.",
+            "only if there really are short-term patterns in these numbers that persist -- which is exactly what's "
+            "being tested.",
+            "it's easy for a model to \"learn\" patterns that were just noise. When first trained on its stocks "
+            "it predicted the 5-day direction only about half a percentage point better than always guessing the "
+            "more common outcome, which its own training check flagged as likely no real signal.",
+            "<p>Treat it as the most experimental of the three.</p>")}
+    '''
+
+
+def _render_about_tab(state=None) -> str:
     return '''
       <h2>About PaperTiger</h2>
       <div class="hint" style="max-width: 100%;">
@@ -1271,7 +1350,7 @@ def _render_about_tab() -> str:
         recommendation to trade any particular security. See README.md for the full setup checklist,
         typical session runbook, and honest limitations list.</p>
       </div>
-    '''
+    ''' + _render_strategy_guide(state)
 
 
 def _render_content() -> str:
@@ -1293,7 +1372,7 @@ def _render_content() -> str:
       <div class="tab-panel" data-tab="walkforward">{_render_walkforward_tab(walkforward)}</div>
       <div class="tab-panel" data-tab="status">{_render_status_tab(state, selftest)}</div>
       <div class="tab-panel" data-tab="config">{_render_config_tab(state)}</div>
-      <div class="tab-panel" data-tab="about">{_render_about_tab()}</div>
+      <div class="tab-panel" data-tab="about">{_render_about_tab(state)}</div>
     '''
 
 
@@ -1387,6 +1466,13 @@ def _render_page() -> str:
   .tab-link {{ color: #60a5fa; cursor: pointer; font-weight: 500; text-transform: none; letter-spacing: normal; }}
   .tab-link:hover {{ text-decoration: underline; }}
   .chart-wrap {{ cursor: crosshair; max-width: 900px; }}
+  .strategy-card {{ background: #1a1d24; border: 1px solid #2a2e37; border-left: 4px solid #4b5563;
+                    border-radius: 8px; padding: 12px 16px; margin-top: 12px; max-width: 900px;
+                    font-size: 13px; line-height: 1.55; color: #c9cdd4; }}
+  .strategy-card h3 {{ margin: 0 0 6px 0; font-size: 15px; color: #e5e7eb; }}
+  .strategy-card p {{ margin: 0 0 8px 0; }}
+  .strategy-kind {{ font-size: 12px; font-weight: 500; color: #9ca3af; margin-left: 6px; }}
+  .strategy-stocks {{ color: #9ca3af; }}
   td.pos {{ color: #34d399; }}
   td.neg {{ color: #f87171; }}
   code {{ background: #1f2229; padding: 1px 5px; border-radius: 3px; font-size: 12px; }}

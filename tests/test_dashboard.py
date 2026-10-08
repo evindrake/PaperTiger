@@ -511,6 +511,21 @@ class TestRenderAboutTab(unittest.TestCase):
         html = _render_about_tab()
         self.assertIn("CASH account", html)
         self.assertIn("buy-and-hold core", html)
+
+    def test_explains_each_strategy_with_its_live_settings_and_stocks(self):
+        state = {"config_snapshot": {
+            "signal_fast": 12, "signal_slow": 40, "signal_period": 10, "signal_oversold": 25,
+            "signal_overbought": 75, "signal_ml_buy_threshold": 0.6, "signal_ml_sell_threshold": 0.4,
+            "sleeve_symbols": {"core": ["SPY"], "sma": ["NVDA", "CAT"], "rsi": [], "ml": ["MSFT"]},
+        }}
+        html = _render_about_tab(state)
+        for title in ("Buy &amp; hold (core)", "SMA crossover", "RSI reversion", "ML classifier"):
+            self.assertIn(title, html)
+        self.assertIn("12-day average is above the 40-day average", html)
+        self.assertIn("RSI is 25 or below", html)
+        self.assertIn("probability is 60% or higher", html)
+        self.assertIn("NVDA, CAT", html)
+        self.assertIn("none yet (assigned when a comparison starts)", html)  # rsi has no stocks here
         self.assertIn("Compare tab", html)
         self.assertIn("Not financial advice", html)
 
