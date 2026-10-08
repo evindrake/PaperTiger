@@ -1253,33 +1253,27 @@ def _render_strategy_guide(state) -> str:
           </div>
         '''
 
-    return f'''
-      <h2>The Strategies</h2>
-      <div class="hint" style="max-width: 100%;">
-        Four strategies run side by side, each with its own pool of money and its own stocks (results on the
-        Compare tab). The three signal strategies all follow the same rules for sizing and safety (the risk profile
-        on the Config tab): each buy is a fixed share of the strategy's pool, a strategy never adds to a stock it
-        already holds, a sell always sells the whole position, and it takes at most one action per stock per day
-        (no same-day round trips). They all look at <em>daily</em> closing prices plus the current price, so they
-        are slow-moving by design -- not day trading.
-      </div>
-      {card("core", "Buy &amp; hold (core)", "the baseline",
+    # Built as plain statements, not inside the f-string below: Python 3.11
+    # (which CI also tests) doesn't allow backslashes inside an f-string's
+    # {...} expressions, and these texts quote things with \".
+    cards = [
+      card("core", "Buy &amp; hold (core)", "the baseline",
             "Buy a fixed basket once and never sell. The basket is SPY, QQQ, VTI and IVV (funds that track the "
             "broad US stock market), BND (a bond fund) and GLD (gold) -- a deliberately boring, diversified mix.",
             "it buys an equal dollar amount of each fund once, at the start, and never sells.",
             "over the long run, when markets rise -- which historically they mostly have. It's always fully "
             "invested and never pays to trade, which makes it surprisingly hard to beat.",
             "in a downturn it falls right along with the market; there's no attempt to step aside.",
-            "<p>It's the yardstick: a signal is only adding something if it beats simply holding.</p>")}
-      {card("sma", "SMA crossover", "trend-following",
+            "<p>It's the yardstick: a signal is only adding something if it beats simply holding.</p>"),
+      card("sma", "SMA crossover", "trend-following",
             f"\"Follow the trend.\" It compares the average closing price over the last {fast:g} trading days "
             f"(the short-term trend) with the average over the last {slow:g} days (the longer-term trend).",
             f"it buys when the {fast:g}-day average is above the {slow:g}-day average -- recent prices running "
             f"higher than usual, an uptrend -- and sells when it drops back below.",
             "in long, steady trends: it can ride most of a big move.",
             "in choppy, sideways markets it gets whipsawed -- buying just after a rise, selling just after a dip. "
-            "Averages also lag, so it's always a little late. On daily prices it can go weeks without a signal.")}
-      {card("rsi", "RSI reversion", "mean-reversion",
+            "Averages also lag, so it's always a little late. On daily prices it can go weeks without a signal."),
+      card("rsi", "RSI reversion", "mean-reversion",
             "\"Buy the dip, sell the rally\" -- the opposite bet to SMA: it assumes stretched moves tend to snap "
             f"back. The RSI (Relative Strength Index) is a 0-100 score of how one-sided the last {period:g} days "
             "of price moves have been: near 0 means mostly falling, near 100 mostly rising.",
@@ -1287,8 +1281,8 @@ def _render_strategy_guide(state) -> str:
             f"when it's {overbought:g} or above (risen hard, \"overbought\").",
             "in choppy, range-bound markets where prices swing back and forth.",
             "in strong trends: it sells winners too early, and can keep buying a stock that just keeps falling "
-            "(\"catching a falling knife\").")}
-      {card("ml", "ML classifier", "experimental machine learning",
+            "(\"catching a falling knife\")."),
+      card("ml", "ML classifier", "experimental machine learning",
             "Let a statistical model look for patterns in history. For each stock it measures nine things about "
             "recent price action -- returns over the last 1, 5, 10 and 20 days, how volatile the last 10 and 20 "
             "days were, the RSI, and how far the price is from its 10- and 30-day averages -- and a logistic "
@@ -1301,7 +1295,20 @@ def _render_strategy_guide(state) -> str:
             "it's easy for a model to \"learn\" patterns that were just noise. When first trained on its stocks "
             "it predicted the 5-day direction only about half a percentage point better than always guessing the "
             "more common outcome, which its own training check flagged as likely no real signal.",
-            "<p>Treat it as the most experimental of the three.</p>")}
+            "<p>Treat it as the most experimental of the three.</p>"),
+    ]
+    cards_html = "".join(cards)
+    return f'''
+      <h2>The Strategies</h2>
+      <div class="hint" style="max-width: 100%;">
+        Four strategies run side by side, each with its own pool of money and its own stocks (results on the
+        Compare tab). The three signal strategies all follow the same rules for sizing and safety (the risk profile
+        on the Config tab): each buy is a fixed share of the strategy's pool, a strategy never adds to a stock it
+        already holds, a sell always sells the whole position, and it takes at most one action per stock per day
+        (no same-day round trips). They all look at <em>daily</em> closing prices plus the current price, so they
+        are slow-moving by design -- not day trading.
+      </div>
+      {cards_html}
     '''
 
 
